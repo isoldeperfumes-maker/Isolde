@@ -1,0 +1,14 @@
+{
+  "name": "isolde-fragrance-store",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Isolde fragrance storefront + admin panel",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
