@@ -17,7 +17,7 @@
 
 /* Isolde transparent logo */
 .brand-logo{display:flex;align-items:center;justify-content:center;line-height:0}
-.brand-logo img{display:block;width:auto;height:46px;max-width:230px;object-fit:contain}
+.brand-logo img{display:block;width:auto;height:58px;max-width:290px;object-fit:contain}
 .footer-logo{display:inline-flex;align-items:center;line-height:0;margin-bottom:14px}
 .footer-logo img{display:block;width:auto;height:58px;max-width:280px;object-fit:contain}
-@media (max-width:620px){.brand-logo img{height:38px;max-width:180px}.footer-logo img{height:50px;max-width:230px}}
+@media (max-width:620px){.brand-logo img{height:44px;max-width:220px}.footer-logo img{height:50px;max-width:230px}}
