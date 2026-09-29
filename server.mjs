@@ -54,7 +54,7 @@ function storagePath(value='') {
 async function ensureStorageBucket(name, isPublic=false) {
   if(!SUPABASE_ENABLED) return;
   const endpoint=`${SUPABASE_URL}/storage/v1/bucket/${encodeURIComponent(name)}`;
-  const check=await fetch(endpoint,{method:'HEAD',headers:storageHeaders()});
+  const check=await fetch(endpoint,{method:'GET',headers:storageHeaders()});
   if(check.ok) return;
   if(check.status!==404) throw new Error(`Supabase bucket check failed (${check.status})`);
   const created=await fetch(`${SUPABASE_URL}/storage/v1/bucket/`,{
