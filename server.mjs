@@ -35,11 +35,108 @@ const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@isolde.local';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'Isolde123!';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'local-development-secret-change-me';
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
+const GOOGLE_SITE_VERIFICATION = process.env.GOOGLE_SITE_VERIFICATION || '';
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || '';
+const SUPABASE_DATA_BUCKET = process.env.SUPABASE_DATA_BUCKET || 'isolde-private';
+const SUPABASE_IMAGE_BUCKET = process.env.SUPABASE_IMAGE_BUCKET || 'isolde-images';
+const SUPABASE_ENABLED = !!SUPABASE_URL && !!SUPABASE_SECRET_KEY;
 const DEFAULT_CURRENCY = (process.env.STORE_CURRENCY || 'CAD').toUpperCase();
 const USING_DEFAULT_ADMIN = !process.env.ADMIN_EMAIL || !process.env.ADMIN_PASSWORD || !process.env.SESSION_SECRET;
+const DB_PATH = path.join(DATA, 'isolde.sqlite');
 
-const db = new DatabaseSync(path.join(DATA, 'isolde.sqlite'));
+function storageHeaders(extra={}) {
+  return {apikey:SUPABASE_SECRET_KEY,Authorization:`Bearer ${SUPABASE_SECRET_KEY}`,...extra};
+}
+function storagePath(value='') {
+  return String(value).split('/').map(encodeURIComponent).join('/');
+}
+async function ensureStorageBucket(name, isPublic=false) {
+  if(!SUPABASE_ENABLED) return;
+  const endpoint=`${SUPABASE_URL}/storage/v1/bucket/${encodeURIComponent(name)}`;
+  const check=await fetch(endpoint,{method:'HEAD',headers:storageHeaders()});
+  if(check.ok) return;
+  if(check.status!==404) throw new Error(`Supabase bucket check failed (${check.status})`);
+  const created=await fetch(`${SUPABASE_URL}/storage/v1/bucket/`,{
+    method:'POST',
+    headers:storageHeaders({'Content-Type':'application/json'}),
+    body:JSON.stringify({id:name,name,public:isPublic})
+  });
+  if(!created.ok) throw new Error(`Supabase bucket creation failed: ${await created.text()}`);
+}
+async function uploadStorageObject(bucket, objectName, bytes, contentType) {
+  const response=await fetch(`${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(bucket)}/${storagePath(objectName)}`,{
+    method:'POST',
+    headers:storageHeaders({'Content-Type':contentType,'x-upsert':'true','Cache-Control':'no-cache'}),
+    body:bytes
+  });
+  if(!response.ok) throw new Error(`Supabase upload failed: ${await response.text()}`);
+}
+async function deleteStorageObject(bucket, objectName) {
+  if(!SUPABASE_ENABLED) return;
+  const response=await fetch(`${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(bucket)}/${storagePath(objectName)}`,{
+    method:'DELETE',
+    headers:storageHeaders()
+  });
+  if(!response.ok && response.status!==404) throw new Error(`Supabase delete failed: ${await response.text()}`);
+}
+function publicStorageUrl(bucket, objectName) {
+  return `${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(bucket)}/${storagePath(objectName)}`;
+}
+function imageObjectFromUrl(value='') {
+  if(!SUPABASE_ENABLED) return null;
+  const prefix=`${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(SUPABASE_IMAGE_BUCKET)}/`;
+  if(!String(value).startsWith(prefix)) return null;
+  return String(value).slice(prefix.length).split('/').map(x=>decodeURIComponent(x)).join('/');
+}
+async function restoreDatabaseFromSupabase() {
+  if(!SUPABASE_ENABLED) return false;
+  await ensureStorageBucket(SUPABASE_DATA_BUCKET,false);
+  await ensureStorageBucket(SUPABASE_IMAGE_BUCKET,true);
+  const response=await fetch(`${SUPABASE_URL}/storage/v1/object/authenticated/${encodeURIComponent(SUPABASE_DATA_BUCKET)}/isolde.sqlite`,{headers:storageHeaders()});
+  if(response.status===400 || response.status===404) return false;
+  if(!response.ok) throw new Error(`Supabase database restore failed: ${await response.text()}`);
+  fs.writeFileSync(DB_PATH,Buffer.from(await response.arrayBuffer()));
+  return true;
+}
+if(SUPABASE_ENABLED) {
+  try { await restoreDatabaseFromSupabase(); }
+  catch(err) { console.error('Supabase startup warning:',err.message); }
+}
+
+const db = new DatabaseSync(DB_PATH);
 db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+let persistChain=Promise.resolve();
+function persistDatabase() {
+  if(!SUPABASE_ENABLED) return Promise.resolve();
+  try {
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    const bytes=fs.readFileSync(DB_PATH);
+    persistChain=persistChain.then(()=>uploadStorageObject(SUPABASE_DATA_BUCKET,'isolde.sqlite',bytes,'application/vnd.sqlite3')).catch(err=>{
+      console.error('Supabase database backup failed:',err.message);
+    });
+    return persistChain;
+  } catch(err) {
+    console.error('Supabase database checkpoint failed:',err.message);
+    return Promise.resolve();
+  }
+}
+async function uploadProductImage(name, bytes, contentType) {
+  const objectName=`products/${name}`;
+  await uploadStorageObject(SUPABASE_IMAGE_BUCKET,objectName,bytes,contentType);
+  return publicStorageUrl(SUPABASE_IMAGE_BUCKET,objectName);
+}
+async function deleteStoredImage(imagePath) {
+  const remote=imageObjectFromUrl(imagePath);
+  if(remote) {
+    try { await deleteStorageObject(SUPABASE_IMAGE_BUCKET,remote); } catch(err) { console.error(err.message); }
+    return;
+  }
+  if(String(imagePath).startsWith('/uploads/products/')) {
+    const file=path.join(PUBLIC,imagePath);
+    try { if(fs.existsSync(file)) fs.unlinkSync(file); } catch {}
+  }
+}
 db.exec(`
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
@@ -230,6 +327,7 @@ if (!catalogueMigrated) {
   for (const [slug, description] of Object.entries(launchDescriptions)) setDescription.run(description, slug);
   db.prepare("UPDATE settings SET value='1' WHERE key='catalogue_v2_migrated'").run();
 }
+await persistDatabase();
 
 function settings() {
   return Object.fromEntries(db.prepare('SELECT key,value FROM settings').all().map(r => [r.key, r.value]));
@@ -252,6 +350,11 @@ function calculateShipping(subtotalCents) {
   return c.flatFeeCents;
 }
 function e(v='') { return String(v ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
+function absoluteAssetUrl(value='') {
+  const v=String(value || '');
+  if(/^https?:\/\//i.test(v)) return v;
+  return `${BASE_URL}${v.startsWith('/')?v:'/'+v}`;
+}
 function money(cents, currency = settings().currency || 'CAD') {
   if (!Number(cents)) return '';
   try { return new Intl.NumberFormat('en-CA', {style:'currency',currency}).format(cents / 100); }
@@ -342,18 +445,34 @@ function getAdminProduct(id) {
   return p;
 }
 
-function baseHead(title, description='') {
+function baseHead(title, description='', options={}) {
   const s=settings();
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e(title)} · ${e(s.brand_name)}</title><meta name="description" content="${e(description || s.hero_subtitle)}"><meta name="theme-color" content="#171512"><link rel="stylesheet" href="/assets/styles.css"><script>window.ISOLDE_CURRENCY=${JSON.stringify(s.currency || 'CAD')};window.ISOLDE_SHIPPING=${JSON.stringify(shippingConfig())}</script><script src="/assets/store.js" defer></script></head><body>`;
+  const isHome=!title || title===s.brand_name;
+  const pageTitle=isHome ? `${s.brand_name} Perfumes | Independent Fragrance House in Canada` : `${title} | ${s.brand_name}`;
+  const metaDescription=String(description || s.hero_subtitle || 'Discover Isolde fragrances, an independent perfume collection in Canada.').trim();
+  const canonicalPath=String(options.canonicalPath || '/');
+  const canonical=`${BASE_URL}${canonicalPath.startsWith('/')?canonicalPath:'/'+canonicalPath}`;
+  const ogImage=absoluteAssetUrl(options.image || '/assets/isolde-logo.png');
+  const robots=options.noindex ? 'noindex,nofollow' : 'index,follow,max-image-preview:large';
+  const organization={
+    "@context":"https://schema.org",
+    "@type":"Organization",
+    name:s.brand_name,
+    url:BASE_URL,
+    logo:absoluteAssetUrl('/assets/isolde-logo.png'),
+    description:metaDescription
+  };
+  if(s.contact_email) organization.email=s.contact_email;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e(pageTitle)}</title><meta name="description" content="${e(metaDescription)}"><meta name="robots" content="${robots}"><link rel="canonical" href="${e(canonical)}"><link rel="icon" type="image/png" href="/assets/isolde-logo.png"><meta name="theme-color" content="#171512"><meta property="og:site_name" content="${e(s.brand_name)}"><meta property="og:type" content="${e(options.type || 'website')}"><meta property="og:title" content="${e(pageTitle)}"><meta property="og:description" content="${e(metaDescription)}"><meta property="og:url" content="${e(canonical)}"><meta property="og:image" content="${e(ogImage)}"><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="${e(pageTitle)}"><meta name="twitter:description" content="${e(metaDescription)}"><meta name="twitter:image" content="${e(ogImage)}">${GOOGLE_SITE_VERIFICATION?`<meta name="google-site-verification" content="${e(GOOGLE_SITE_VERIFICATION)}">`:''}<script type="application/ld+json">${JSON.stringify(organization).replace(/</g,'\\u003c')}</script><link rel="stylesheet" href="/assets/styles.css"><script>window.ISOLDE_CURRENCY=${JSON.stringify(s.currency || 'CAD')};window.ISOLDE_SHIPPING=${JSON.stringify(shippingConfig())}</script><script src="/assets/store.js" defer></script></head><body>`;
 }
-function publicHeader(active='') {
+function publicHeader(active='', seo={}) {
   const s=settings();
-  return `${baseHead(active ? active : s.brand_name)}
+  return `${baseHead(active ? active : s.brand_name, seo.description || '', seo)}
   <div class="announcement">${e(s.announcement)}</div>
   <header class="site-header"><div class="container nav">
     <nav class="nav-links"><a href="/shop">Shop</a><a href="/shop?audience=Women">Women</a><a href="/shop?audience=Men">Men</a><a href="/shop?audience=Unisex">Unisex</a></nav>
     <button class="menu-button" data-menu-toggle aria-label="Menu">☰</button>
-    <a class="brand brand-logo" href="/" aria-label="${e(s.brand_name)} home"><img src="/assets/isolde-logo.png" alt="${e(s.brand_name)}"></a>
+    <a class="brand brand-logo" href="/" aria-label="${e(s.brand_name)} home"><img src="/assets/isolde-logo.png" alt="${e(s.brand_name)} perfume logo"></a>
     <div class="nav-actions"><a href="/about">Our Story</a><a class="bag-pill" href="/cart">Bag <span data-cart-count>0</span></a></div>
   </div><div class="mobile-menu" data-mobile-menu><a href="/shop">Shop all</a><a href="/shop?audience=Women">Women</a><a href="/shop?audience=Men">Men</a><a href="/shop?audience=Unisex">Unisex</a><a href="/about">Our Story</a><a href="/contact">Contact</a></div></header>`;
 }
@@ -386,7 +505,7 @@ function homePage() {
     {audience:'Men',title:'For Him',copy:'Fresh woods, aromatic depth and confident character.',product:all.find(x=>x.slug==='blue-elixir')},
     {audience:'Unisex',title:'Unisex',copy:'Warm, distinctive scents designed beyond labels.',product:all.find(x=>x.slug==='golden-orchid')}
   ].filter(x=>x.product);
-  return `${publicHeader()}<main>
+  return `${publicHeader('',{canonicalPath:'/',description:'Shop Isolde perfumes in Canada. Discover independent fragrances for women, men and unisex wear, with clear scent inspiration and 100 mL bottles.'})}<main>
   <section class="lux-hero"><div class="container lux-hero-grid"><div class="lux-hero-copy"><div class="eyebrow">${e(s.hero_eyebrow)}</div><h1>${e(s.hero_title)}</h1><p class="lead">${e(s.hero_subtitle)}</p><div class="hero-actions"><a class="btn" href="/shop">Shop all fragrances</a><a class="text-link" href="/about">Discover the house →</a></div><div class="hero-facts"><span>100 mL</span><span>9 signature scents</span><span>Independent fragrance house</span></div></div>
   <div class="lux-hero-media"><a class="hero-main-photo" href="/product/${e(heroMain.slug)}"><img src="${e(heroMain.image)}" alt="${e(heroMain.name)}"><div class="image-caption"><span>${e(heroMain.name)}</span><strong>${e(money(heroMain.price_cents))}</strong></div></a><a class="hero-float-photo" href="/product/${e(heroSide.slug)}"><img src="${e(heroSide.image)}" alt="${e(heroSide.name)}"></a></div></div></section>
 
@@ -405,16 +524,17 @@ function homePage() {
 function shopPage() {
   const products=getProducts();
   const cats=[...new Set(products.map(p=>p.category))];
-  return `${publicHeader('Shop')}<main><section class="page-hero shop-hero"><div class="container"><div class="eyebrow">The Isolde Collection</div><h1>Find your signature.</h1><p class="lead">Explore all ${products.length} fragrances by audience, scent family, inspiration or price.</p></div></section>
+  return `${publicHeader('Shop',{canonicalPath:'/shop',description:'Shop the complete Isolde perfume collection in Canada. Browse fragrances for women, men and unisex wear by scent family, inspiration and price.'})}<main><section class="page-hero shop-hero"><div class="container"><div class="eyebrow">The Isolde Collection</div><h1>Find your signature.</h1><p class="lead">Explore all ${products.length} fragrances by audience, scent family, inspiration or price.</p></div></section>
   <section style="padding-top:20px"><div class="container"><div class="shop-toolbar shop-toolbar-4"><input class="field" data-shop-search placeholder="Search fragrances or inspirations…"><select class="select" data-shop-audience><option value="">Women, Men & Unisex</option><option>Women</option><option>Men</option><option>Unisex</option></select><select class="select" data-shop-category><option value="">All scent families</option>${cats.map(c=>`<option>${e(c)}</option>`).join('')}</select><select class="select" data-shop-sort><option value="default">Curated order</option><option value="name">Name A–Z</option><option value="price-asc">Price low to high</option><option value="price-desc">Price high to low</option></select></div><div class="shop-result-line"><span><strong data-shop-count>${products.length}</strong> fragrances</span><a href="/shop">Clear filters</a></div><div class="product-grid" data-shop-grid>${products.map(productCard).join('')}</div></div></section></main>${publicFooter()}`;
 }
 function productPage(p) {
   const s=settings();
   const image=(p.images[0]?.path || '');
   const payload=JSON.stringify({id:p.id,slug:p.slug,name:p.name,inspiredBy:p.inspired_by,image,priceCents:p.price_cents}).replace(/'/g,'&#39;');
-  const jsonLd={"@context":"https://schema.org","@type":"Product",name:p.name,brand:{"@type":"Brand",name:s.brand_name},description:p.description,image:p.images.map(i=>BASE_URL+i.path)};
-  if(p.price_cents>0) jsonLd.offers={"@type":"Offer",priceCurrency:s.currency,price:(p.price_cents/100).toFixed(2),availability:"https://schema.org/InStock"};
-  return `${baseHead(p.name,p.description).replace('</head>',`<script type="application/ld+json">${JSON.stringify(jsonLd).replace(/</g,'\\u003c')}</script></head>`)}
+  const canonicalPath=`/product/${encodeURIComponent(p.slug)}`;
+  const jsonLd={"@context":"https://schema.org","@type":"Product",name:p.name,brand:{"@type":"Brand",name:s.brand_name},description:p.description,image:p.images.map(i=>absoluteAssetUrl(i.path)),sku:p.sku||undefined,url:`${BASE_URL}${canonicalPath}`};
+  if(p.price_cents>0) jsonLd.offers={"@type":"Offer",priceCurrency:s.currency,price:(p.price_cents/100).toFixed(2),availability:p.stock===0?"https://schema.org/OutOfStock":"https://schema.org/InStock",url:`${BASE_URL}${canonicalPath}`,seller:{"@type":"Organization",name:s.brand_name}};
+  return `${baseHead(p.name,p.description,{canonicalPath,image,type:'product'}).replace('</head>',`<script type="application/ld+json">${JSON.stringify(jsonLd).replace(/</g,'\\u003c')}</script></head>`)}
   <div class="announcement">${e(s.announcement)}</div><header class="site-header"><div class="container nav"><nav class="nav-links"><a href="/shop">Shop</a><a href="/shop?audience=Women">Women</a><a href="/shop?audience=Men">Men</a><a href="/shop?audience=Unisex">Unisex</a></nav><button class="menu-button" data-menu-toggle>☰</button><a class="brand brand-logo" href="/" aria-label="${e(s.brand_name)} home"><img src="/assets/isolde-logo.png" alt="${e(s.brand_name)}"></a><div class="nav-actions"><a href="/about">Our Story</a><a class="bag-pill" href="/cart">Bag <span data-cart-count>0</span></a></div></div><div class="mobile-menu" data-mobile-menu><a href="/shop">Shop all</a><a href="/shop?audience=Women">Women</a><a href="/shop?audience=Men">Men</a><a href="/shop?audience=Unisex">Unisex</a><a href="/about">Our Story</a></div></header>
   <main><div class="container product-page"><div><div class="gallery-main"><img src="${e(image)}" alt="${e(p.name)}"></div>${p.images.length>1?`<div class="thumbs">${p.images.map(i=>`<button class="thumb" type="button" data-gallery-thumb data-image="${e(i.path)}"><img src="${e(i.path)}" alt="${e(i.alt)}"></button>`).join('')}</div>`:''}</div>
   <div class="product-detail"><div class="product-detail-topline"><span>${e(p.audience||'Unisex')}</span><span>${e(p.category)}</span></div><h1>${e(p.name)}</h1><div class="inspired-line">Inspired by <strong>${e(p.inspired_by)}</strong></div>${p.price_cents>0?`<div class="detail-price">${e(money(p.price_cents))}</div>`:'<div class="coming" style="margin-top:22px">Price coming soon.</div>'}<p class="product-description">${e(p.description)}</p>
@@ -423,7 +543,7 @@ function productPage(p) {
   <div class="product-meta">${p.size_ml?`<div class="meta-row"><span>Size</span><strong>${p.size_ml} mL</strong></div>`:''}<div class="meta-row"><span>For</span><strong>${e(p.audience||'Unisex')}</strong></div><div class="meta-row"><span>Scent family</span><strong>${e(p.category)}</strong></div>${p.sku?`<div class="meta-row"><span>SKU</span><strong>${e(p.sku)}</strong></div>`:''}</div><p class="small muted" style="margin-top:18px">Independent fragrance interpretation. Not affiliated with or endorsed by the referenced designer brand.</p></div></div></main>${publicFooter()}`;
 }
 function cartPage() {
-  return `${publicHeader('Bag')}<main><section class="page-hero"><div class="container"><div class="eyebrow">Your bag</div><h1>Your Isolde selection.</h1></div></section><section style="padding-top:10px"><div class="container cart-layout"><div><div data-cart-page></div><div data-cart-empty hidden><p class="lead">Your bag is empty.</p><a class="btn" href="/shop">Explore fragrances</a></div></div><aside class="summary-card" data-cart-summary hidden><h3 style="font-size:1.7rem;margin-top:0">Order summary</h3><div class="summary-row"><span>Items</span><span data-cart-items>0</span></div><div class="summary-row"><span>Subtotal</span><strong data-cart-subtotal>—</strong></div><p class="small muted">Shipping and applicable tax are confirmed during checkout.</p><a class="btn" href="/checkout">Continue to checkout</a></aside></div></section></main>${publicFooter()}`;
+  return `${publicHeader('Bag',{canonicalPath:'/cart',noindex:true})}<main><section class="page-hero"><div class="container"><div class="eyebrow">Your bag</div><h1>Your Isolde selection.</h1></div></section><section style="padding-top:10px"><div class="container cart-layout"><div><div data-cart-page></div><div data-cart-empty hidden><p class="lead">Your bag is empty.</p><a class="btn" href="/shop">Explore fragrances</a></div></div><aside class="summary-card" data-cart-summary hidden><h3 style="font-size:1.7rem;margin-top:0">Order summary</h3><div class="summary-row"><span>Items</span><span data-cart-items>0</span></div><div class="summary-row"><span>Subtotal</span><strong data-cart-subtotal>—</strong></div><p class="small muted">Shipping and applicable tax are confirmed during checkout.</p><a class="btn" href="/checkout">Continue to checkout</a></aside></div></section></main>${publicFooter()}`;
 }
 function checkoutPage() {
   const s=settings();
@@ -431,10 +551,10 @@ function checkoutPage() {
   const stripeReady=!!STRIPE_SECRET_KEY && ship.mode!=='quote';
   const payCopy = stripeReady ? 'Continue to secure payment' : 'Place order request';
   const helper = stripeReady ? 'Payment is completed securely through Stripe. Shipping is calculated from your store settings.' : (STRIPE_SECRET_KEY && ship.mode==='quote' ? 'Stripe is connected, but shipping is still set to “Quote after order.” Set a flat or free shipping method in Admin → Settings to charge cards automatically.' : 'The order will be saved in your Isolde admin dashboard for payment and shipping follow-up.');
-  return `${publicHeader('Checkout')}<main><section class="page-hero"><div class="container"><div class="eyebrow">Checkout</div><h1>Complete your order.</h1></div></section><section style="padding-top:8px"><div class="container checkout-grid"><form data-checkout-form><div class="form-grid"><div class="form-group"><label>First & last name</label><input name="customer_name" required></div><div class="form-group"><label>Email</label><input type="email" name="email" required></div><div class="form-group"><label>Phone</label><input type="tel" name="phone"></div><div class="form-group"><label>Country</label><input name="country" value="${e(ship.countries[0]||'Canada')}" required></div><div class="form-group span-2"><label>Address</label><input name="address1" required></div><div class="form-group span-2"><label>Apartment / suite (optional)</label><input name="address2"></div><div class="form-group"><label>City</label><input name="city" required></div><div class="form-group"><label>Province / state</label><input name="province" required></div><div class="form-group"><label>Postal / ZIP code</label><input name="postal_code" required></div><div class="form-group span-2"><label>Order note (optional)</label><textarea name="notes" rows="3"></textarea></div></div><button class="btn" type="submit" style="margin-top:22px">${payCopy}</button><p class="small muted">${e(helper)}</p></form><aside class="summary-card"><h3 style="font-size:1.7rem;margin-top:0">Order summary</h3><div data-checkout-items class="checkout-lines"></div><div class="summary-row" style="margin-top:12px"><span>Subtotal</span><strong data-checkout-subtotal>—</strong></div><div class="summary-row"><span>Shipping</span><strong data-checkout-shipping>—</strong></div><div class="summary-row checkout-total"><span>Total</span><strong data-checkout-total>—</strong></div><p class="small muted">${e(s.shipping_note)}</p></aside></div></section></main>${publicFooter()}`;
+  return `${publicHeader('Checkout',{canonicalPath:'/checkout',noindex:true})}<main><section class="page-hero"><div class="container"><div class="eyebrow">Checkout</div><h1>Complete your order.</h1></div></section><section style="padding-top:8px"><div class="container checkout-grid"><form data-checkout-form><div class="form-grid"><div class="form-group"><label>First & last name</label><input name="customer_name" required></div><div class="form-group"><label>Email</label><input type="email" name="email" required></div><div class="form-group"><label>Phone</label><input type="tel" name="phone"></div><div class="form-group"><label>Country</label><input name="country" value="${e(ship.countries[0]||'Canada')}" required></div><div class="form-group span-2"><label>Address</label><input name="address1" required></div><div class="form-group span-2"><label>Apartment / suite (optional)</label><input name="address2"></div><div class="form-group"><label>City</label><input name="city" required></div><div class="form-group"><label>Province / state</label><input name="province" required></div><div class="form-group"><label>Postal / ZIP code</label><input name="postal_code" required></div><div class="form-group span-2"><label>Order note (optional)</label><textarea name="notes" rows="3"></textarea></div></div><button class="btn" type="submit" style="margin-top:22px">${payCopy}</button><p class="small muted">${e(helper)}</p></form><aside class="summary-card"><h3 style="font-size:1.7rem;margin-top:0">Order summary</h3><div data-checkout-items class="checkout-lines"></div><div class="summary-row" style="margin-top:12px"><span>Subtotal</span><strong data-checkout-subtotal>—</strong></div><div class="summary-row"><span>Shipping</span><strong data-checkout-shipping>—</strong></div><div class="summary-row checkout-total"><span>Total</span><strong data-checkout-total>—</strong></div><p class="small muted">${e(s.shipping_note)}</p></aside></div></section></main>${publicFooter()}`;
 }
 function successPage(orderNo, paid=false) {
-  return `${publicHeader('Order received')}<main><section class="page-hero"><div class="container info-page"><div class="eyebrow">${paid?'Payment confirmed':'Order received'}</div><h1>Thank you.</h1><p class="lead">Your Isolde order <strong>${e(orderNo || '')}</strong> has been received${paid?' and payment has been confirmed':''}.</p><p>We’ll use the contact details on the order to provide the next update.</p><a class="btn" href="/shop">Continue shopping</a></div></section></main>${publicFooter()}`;
+  return `${publicHeader('Order received',{canonicalPath:'/order/success',noindex:true})}<main><section class="page-hero"><div class="container info-page"><div class="eyebrow">${paid?'Payment confirmed':'Order received'}</div><h1>Thank you.</h1><p class="lead">Your Isolde order <strong>${e(orderNo || '')}</strong> has been received${paid?' and payment has been confirmed':''}.</p><p>We’ll use the contact details on the order to provide the next update.</p><a class="btn" href="/shop">Continue shopping</a></div></section></main>${publicFooter()}`;
 }
 function infoPage(kind) {
   const s=settings();
@@ -446,11 +566,11 @@ function infoPage(kind) {
     privacy:["Privacy",`This starter store collects the information required to process orders, including customer name, contact details and shipping address.`, `If Stripe is enabled, payment card information is handled by Stripe rather than stored in the Isolde database.`, `Before public launch, update this page to reflect your actual analytics, email-marketing and cookie tools.`],
     terms:["Terms",`Product images and descriptions are provided for shopping and product-identification purposes.`, `Designer fragrance names are used only as comparative references to describe scent inspiration. Isolde is an independent brand and is not affiliated with or endorsed by those trademark owners.`, `Before public launch, have your final terms reviewed for your jurisdiction and business model.`]
   }[kind];
-  return `${publicHeader(content[0])}<main><section class="page-hero"><div class="container info-page"><div class="eyebrow">Isolde</div><h1>${e(content[0])}</h1>${content.slice(1).map((p,i)=>`<p class="${i===0?'lead':''}" style="white-space:pre-line">${e(p)}</p>`).join('')}</div></section></main>${publicFooter()}`;
+  return `${publicHeader(content[0],{canonicalPath:`/${kind}`,description:content[1]})}<main><section class="page-hero"><div class="container info-page"><div class="eyebrow">Isolde</div><h1>${e(content[0])}</h1>${content.slice(1).map((p,i)=>`<p class="${i===0?'lead':''}" style="white-space:pre-line">${e(p)}</p>`).join('')}</div></section></main>${publicFooter()}`;
 }
 
 function adminHead(title, csrf='') {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e(title)} · Isolde Admin</title><meta name="csrf-token" content="${e(csrf)}"><link rel="stylesheet" href="/assets/styles.css"><script src="/assets/admin.js" defer></script></head><body class="admin-body">`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e(title)} · Isolde Admin</title><meta name="robots" content="noindex,nofollow"><meta name="csrf-token" content="${e(csrf)}"><link rel="stylesheet" href="/assets/styles.css"><script src="/assets/admin.js" defer></script></head><body class="admin-body">`;
 }
 function adminLayout(title, body, session, active='') {
   return `${adminHead(title,session.csrf)}<div class="admin-shell"><aside class="admin-side"><a class="brand" href="/admin">Isolde</a>${[['Dashboard','/admin','dashboard'],['Products','/admin/products','products'],['Orders','/admin/orders','orders'],['Settings','/admin/settings','settings']].map(([n,h,k])=>`<a class="${active===k?'active':''}" href="${h}">${n}</a>`).join('')}<a href="/" target="_blank">View store ↗</a><form method="post" action="/admin/logout" style="margin-top:18px"><button style="background:transparent;border:0;color:#cfc6b9;padding:10px 12px">Sign out</button></form></aside><main class="admin-main">${USING_DEFAULT_ADMIN?'<div class="error-box" style="margin-bottom:18px">Default local admin credentials are active. Set ADMIN_EMAIL, ADMIN_PASSWORD and SESSION_SECRET in a .env file before publishing this site.</div>':''}${body}</main></div></body></html>`;
@@ -527,16 +647,22 @@ function orderNumber() {
 async function createStripeSession(order, items) {
   const params=new URLSearchParams();
   params.set('mode','payment');
+  params.set('locale','auto');
+  params.set('billing_address_collection','auto');
+  params.set('client_reference_id',order.order_number);
   params.set('success_url',`${BASE_URL}/order/success?order=${encodeURIComponent(order.order_number)}&session_id={CHECKOUT_SESSION_ID}`);
   params.set('cancel_url',`${BASE_URL}/checkout`);
   params.set('customer_email',order.email);
   params.set('metadata[order_id]',String(order.id));
   params.set('metadata[order_number]',order.order_number);
+  params.set('payment_intent_data[metadata][order_id]',String(order.id));
+  params.set('payment_intent_data[metadata][order_number]',order.order_number);
   items.forEach((item,i)=>{
     params.set(`line_items[${i}][quantity]`,String(item.qty));
     params.set(`line_items[${i}][price_data][currency]`,(settings().currency||'CAD').toLowerCase());
     params.set(`line_items[${i}][price_data][unit_amount]`,String(item.unit_price_cents));
     params.set(`line_items[${i}][price_data][product_data][name]`,item.name);
+    if(item.image) params.set(`line_items[${i}][price_data][product_data][images][0]`,absoluteAssetUrl(item.image));
   });
   if (Number(order.shipping_cents||0) > 0) {
     const i=items.length;
@@ -557,7 +683,10 @@ async function verifyStripeSuccess(sessionId) {
   const data=await response.json();
   if(data.payment_status==='paid') {
     const orderId=Number(data.metadata?.order_id || 0);
-    if(orderId) db.prepare("UPDATE orders SET payment_status='paid', status=CASE WHEN status='new' THEN 'processing' ELSE status END WHERE id=?").run(orderId);
+    if(orderId) {
+      db.prepare("UPDATE orders SET payment_status='paid', status=CASE WHEN status='new' THEN 'processing' ELSE status END WHERE id=?").run(orderId);
+      await persistDatabase();
+    }
     return true;
   }
   return false;
@@ -591,7 +720,7 @@ const server=http.createServer(async (req,res)=>{
       for(const k of required) if(!String(data[k]||'').trim()){json(res,400,{error:`${k.replaceAll('_',' ')} is required.`});return;}
       if(!Array.isArray(data.items)||!data.items.length){json(res,400,{error:'Your bag is empty.'});return;}
       const resolved=[]; let subtotal=0;
-      for(const raw of data.items){const p=db.prepare("SELECT * FROM products WHERE id=? AND status='active'").get(Number(raw.id)); const qty=Math.max(1,Math.min(20,Number(raw.qty)||1)); if(!p||p.price_cents<=0){json(res,400,{error:'One or more products are not currently available for online checkout.'});return;} resolved.push({product_id:p.id,name:p.name,qty,unit_price_cents:p.price_cents}); subtotal += p.price_cents*qty;}
+      for(const raw of data.items){const p=db.prepare("SELECT * FROM products WHERE id=? AND status='active'").get(Number(raw.id)); const qty=Math.max(1,Math.min(20,Number(raw.qty)||1)); if(!p||p.price_cents<=0){json(res,400,{error:'One or more products are not currently available for online checkout.'});return;} const image=db.prepare('SELECT path FROM product_images WHERE product_id=? ORDER BY is_primary DESC,sort_order,id LIMIT 1').get(p.id)?.path||''; resolved.push({product_id:p.id,name:p.name,qty,unit_price_cents:p.price_cents,image}); subtotal += p.price_cents*qty;}
       const shipping=calculateShipping(subtotal);
       const stripeReady=!!STRIPE_SECRET_KEY && shipping!==null;
       const orderNo=orderNumber(); const method=stripeReady?'stripe':'manual';
@@ -600,9 +729,9 @@ const server=http.createServer(async (req,res)=>{
       const r=db.prepare(`INSERT INTO orders(order_number,customer_name,email,phone,address1,address2,city,province,postal_code,country,subtotal_cents,shipping_cents,total_cents,status,payment_status,payment_method,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'new','pending',?,?)`).run(orderNo,String(data.customer_name).trim(),String(data.email).trim(),String(data.phone||'').trim(),String(data.address1).trim(),String(data.address2||'').trim(),String(data.city).trim(),String(data.province).trim(),String(data.postal_code).trim(),String(data.country).trim(),subtotal,shippingCents,total,method,String(data.notes||'').trim());
       const orderId=Number(r.lastInsertRowid); const ins=db.prepare('INSERT INTO order_items(order_id,product_id,name,qty,unit_price_cents) VALUES(?,?,?,?,?)'); resolved.forEach(i=>ins.run(orderId,i.product_id,i.name,i.qty,i.unit_price_cents));
       if(stripeReady){
-        try { const session=await createStripeSession({id:orderId,order_number:orderNo,email:data.email,shipping_cents:shippingCents},resolved); db.prepare('UPDATE orders SET stripe_session_id=? WHERE id=?').run(session.id,orderId); json(res,200,{orderNumber:orderNo,checkoutUrl:session.url,shippingCents,totalCents:total}); }
-        catch(err){ db.prepare("UPDATE orders SET payment_method='manual' WHERE id=?").run(orderId); json(res,200,{orderNumber:orderNo,warning:'Stripe checkout was unavailable, so the order was saved for manual follow-up.',shippingCents,totalCents:total}); }
-      } else json(res,200,{orderNumber:orderNo,shippingCents:shipping,totalCents:shipping===null?null:total});
+        try { const session=await createStripeSession({id:orderId,order_number:orderNo,email:data.email,shipping_cents:shippingCents},resolved); db.prepare('UPDATE orders SET stripe_session_id=? WHERE id=?').run(session.id,orderId); await persistDatabase(); json(res,200,{orderNumber:orderNo,checkoutUrl:session.url,shippingCents,totalCents:total}); }
+        catch(err){ db.prepare("UPDATE orders SET payment_method='manual' WHERE id=?").run(orderId); await persistDatabase(); json(res,200,{orderNumber:orderNo,warning:'Stripe checkout was unavailable, so the order was saved for manual follow-up.',shippingCents,totalCents:total}); }
+      } else { await persistDatabase(); json(res,200,{orderNumber:orderNo,shippingCents:shipping,totalCents:shipping===null?null:total}); }
       return;
     }
     if(req.method==='GET' && pathname==='/order/success'){
@@ -629,32 +758,32 @@ const server=http.createServer(async (req,res)=>{
     // Admin APIs
     if(pathname==='/api/admin/products'&&req.method==='POST'){
       const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired. Refresh and try again.'});return;}const d=await readJson(req);const name=String(d.name||'').trim(), slug=slugify(d.slug||name);if(!name||!slug){json(res,400,{error:'Name and slug are required.'});return;}
-      try{const audience=['Women','Men','Unisex'].includes(d.audience)?d.audience:'Unisex';const r=db.prepare(`INSERT INTO products(slug,name,inspired_by,description,category,audience,price_cents,compare_at_cents,size_ml,sku,stock,status,featured,bestseller,sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(slug,name,String(d.inspired_by||''),String(d.description||''),String(d.category||'Signature'),audience,Number(d.price||0),d.compare_at_price==null?null:Number(d.compare_at_price),d.size_ml==null?null:Number(d.size_ml),String(d.sku||''),d.stock==null?null:Number(d.stock),d.status==='active'?'active':'draft',d.featured?1:0,d.bestseller?1:0,Number(d.sort_order||50));json(res,200,{id:Number(r.lastInsertRowid)});}catch(err){json(res,400,{error:String(err.message).includes('UNIQUE')?'That URL slug already exists.':err.message});}return;
+      try{const audience=['Women','Men','Unisex'].includes(d.audience)?d.audience:'Unisex';const r=db.prepare(`INSERT INTO products(slug,name,inspired_by,description,category,audience,price_cents,compare_at_cents,size_ml,sku,stock,status,featured,bestseller,sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(slug,name,String(d.inspired_by||''),String(d.description||''),String(d.category||'Signature'),audience,Number(d.price||0),d.compare_at_price==null?null:Number(d.compare_at_price),d.size_ml==null?null:Number(d.size_ml),String(d.sku||''),d.stock==null?null:Number(d.stock),d.status==='active'?'active':'draft',d.featured?1:0,d.bestseller?1:0,Number(d.sort_order||50));await persistDatabase();json(res,200,{id:Number(r.lastInsertRowid)});}catch(err){json(res,400,{error:String(err.message).includes('UNIQUE')?'That URL slug already exists.':err.message});}return;
     }
     m=pathname.match(/^\/api\/admin\/products\/(\d+)$/); if(m&&req.method==='PUT'){
       const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const id=Number(m[1]),d=await readJson(req);const name=String(d.name||'').trim(),slug=slugify(d.slug||name);if(!name||!slug){json(res,400,{error:'Name and slug are required.'});return;}
-      try{const audience=['Women','Men','Unisex'].includes(d.audience)?d.audience:'Unisex';db.prepare(`UPDATE products SET slug=?,name=?,inspired_by=?,description=?,category=?,audience=?,price_cents=?,compare_at_cents=?,size_ml=?,sku=?,stock=?,status=?,featured=?,bestseller=?,sort_order=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(slug,name,String(d.inspired_by||''),String(d.description||''),String(d.category||'Signature'),audience,Number(d.price||0),d.compare_at_price==null?null:Number(d.compare_at_price),d.size_ml==null?null:Number(d.size_ml),String(d.sku||''),d.stock==null?null:Number(d.stock),d.status==='active'?'active':'draft',d.featured?1:0,d.bestseller?1:0,Number(d.sort_order||50),id);json(res,200,{ok:true});}catch(err){json(res,400,{error:String(err.message).includes('UNIQUE')?'That URL slug already exists.':err.message});}return;
+      try{const audience=['Women','Men','Unisex'].includes(d.audience)?d.audience:'Unisex';db.prepare(`UPDATE products SET slug=?,name=?,inspired_by=?,description=?,category=?,audience=?,price_cents=?,compare_at_cents=?,size_ml=?,sku=?,stock=?,status=?,featured=?,bestseller=?,sort_order=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(slug,name,String(d.inspired_by||''),String(d.description||''),String(d.category||'Signature'),audience,Number(d.price||0),d.compare_at_price==null?null:Number(d.compare_at_price),d.size_ml==null?null:Number(d.size_ml),String(d.sku||''),d.stock==null?null:Number(d.stock),d.status==='active'?'active':'draft',d.featured?1:0,d.bestseller?1:0,Number(d.sort_order||50),id);await persistDatabase();json(res,200,{ok:true});}catch(err){json(res,400,{error:String(err.message).includes('UNIQUE')?'That URL slug already exists.':err.message});}return;
     }
     if(m&&req.method==='DELETE'){
-      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const id=Number(m[1]);const imgs=db.prepare('SELECT path FROM product_images WHERE product_id=?').all(id);db.prepare('DELETE FROM products WHERE id=?').run(id);for(const img of imgs){if(img.path.startsWith('/uploads/products/')){const f=path.join(PUBLIC,img.path);try{if(fs.existsSync(f))fs.unlinkSync(f)}catch{}}}json(res,200,{ok:true});return;
+      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const id=Number(m[1]);const imgs=db.prepare('SELECT path FROM product_images WHERE product_id=?').all(id);db.prepare('DELETE FROM products WHERE id=?').run(id);for(const img of imgs) await deleteStoredImage(img.path);await persistDatabase();json(res,200,{ok:true});return;
     }
     m=pathname.match(/^\/api\/admin\/products\/(\d+)\/images$/); if(m&&req.method==='POST'){
-      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const productId=Number(m[1]);if(!db.prepare('SELECT id FROM products WHERE id=?').get(productId)){json(res,404,{error:'Product not found'});return;}const d=await readJson(req);const match=String(d.dataUrl||'').match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/);if(!match){json(res,400,{error:'Please upload a PNG, JPG or WebP image.'});return;}const buf=Buffer.from(match[2],'base64');if(buf.length>10*1024*1024){json(res,400,{error:'Image must be under 10 MB.'});return;}const ext=match[1]==='image/png'?'.png':match[1]==='image/webp'?'.webp':'.jpg';const name=`p${productId}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`;fs.writeFileSync(path.join(UPLOADS,name),buf);const count=db.prepare('SELECT COUNT(*) n FROM product_images WHERE product_id=?').get(productId).n;const r=db.prepare('INSERT INTO product_images(product_id,path,alt,sort_order,is_primary) VALUES(?,?,?,?,?)').run(productId,`/uploads/products/${name}`,String(d.alt||''),count,count===0?1:0);json(res,200,{id:Number(r.lastInsertRowid),path:`/uploads/products/${name}`});return;
+      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const productId=Number(m[1]);if(!db.prepare('SELECT id FROM products WHERE id=?').get(productId)){json(res,404,{error:'Product not found'});return;}const d=await readJson(req);const match=String(d.dataUrl||'').match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/);if(!match){json(res,400,{error:'Please upload a PNG, JPG or WebP image.'});return;}const buf=Buffer.from(match[2],'base64');if(buf.length>10*1024*1024){json(res,400,{error:'Image must be under 10 MB.'});return;}const ext=match[1]==='image/png'?'.png':match[1]==='image/webp'?'.webp':'.jpg';const name=`p${productId}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`;let imagePath;if(SUPABASE_ENABLED){imagePath=await uploadProductImage(name,buf,match[1]);}else{fs.writeFileSync(path.join(UPLOADS,name),buf);imagePath=`/uploads/products/${name}`;}const count=db.prepare('SELECT COUNT(*) n FROM product_images WHERE product_id=?').get(productId).n;const r=db.prepare('INSERT INTO product_images(product_id,path,alt,sort_order,is_primary) VALUES(?,?,?,?,?)').run(productId,imagePath,String(d.alt||''),count,count===0?1:0);await persistDatabase();json(res,200,{id:Number(r.lastInsertRowid),path:imagePath});return;
     }
     m=pathname.match(/^\/api\/admin\/images\/(\d+)$/); if(m&&req.method==='DELETE'){
-      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const id=Number(m[1]);const img=db.prepare('SELECT * FROM product_images WHERE id=?').get(id);if(!img){json(res,404,{error:'Image not found'});return;}db.prepare('DELETE FROM product_images WHERE id=?').run(id);if(img.path.startsWith('/uploads/products/')){const f=path.join(PUBLIC,img.path);try{if(fs.existsSync(f))fs.unlinkSync(f)}catch{}}const any=db.prepare('SELECT id FROM product_images WHERE product_id=? ORDER BY sort_order,id LIMIT 1').get(img.product_id);if(any)db.prepare('UPDATE product_images SET is_primary=CASE WHEN id=? THEN 1 ELSE 0 END WHERE product_id=?').run(any.id,img.product_id);json(res,200,{ok:true});return;
+      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const id=Number(m[1]);const img=db.prepare('SELECT * FROM product_images WHERE id=?').get(id);if(!img){json(res,404,{error:'Image not found'});return;}db.prepare('DELETE FROM product_images WHERE id=?').run(id);await deleteStoredImage(img.path);const any=db.prepare('SELECT id FROM product_images WHERE product_id=? ORDER BY sort_order,id LIMIT 1').get(img.product_id);if(any)db.prepare('UPDATE product_images SET is_primary=CASE WHEN id=? THEN 1 ELSE 0 END WHERE product_id=?').run(any.id,img.product_id);await persistDatabase();json(res,200,{ok:true});return;
     }
     m=pathname.match(/^\/api\/admin\/images\/(\d+)\/primary$/); if(m&&req.method==='POST'){
-      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const id=Number(m[1]);const img=db.prepare('SELECT * FROM product_images WHERE id=?').get(id);if(!img){json(res,404,{error:'Image not found'});return;}db.prepare('UPDATE product_images SET is_primary=CASE WHEN id=? THEN 1 ELSE 0 END WHERE product_id=?').run(id,img.product_id);json(res,200,{ok:true});return;
+      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const id=Number(m[1]);const img=db.prepare('SELECT * FROM product_images WHERE id=?').get(id);if(!img){json(res,404,{error:'Image not found'});return;}db.prepare('UPDATE product_images SET is_primary=CASE WHEN id=? THEN 1 ELSE 0 END WHERE product_id=?').run(id,img.product_id);await persistDatabase();json(res,200,{ok:true});return;
     }
     m=pathname.match(/^\/api\/admin\/orders\/(\d+)$/); if(m&&req.method==='PUT'){
-      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const d=await readJson(req);const allowedStatus=['new','processing','fulfilled','cancelled'],allowedPay=['pending','paid','refunded','cancelled'];if(!allowedStatus.includes(d.status)||!allowedPay.includes(d.payment_status)){json(res,400,{error:'Invalid order status.'});return;}db.prepare('UPDATE orders SET status=?,payment_status=? WHERE id=?').run(d.status,d.payment_status,Number(m[1]));json(res,200,{ok:true});return;
+      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const d=await readJson(req);const allowedStatus=['new','processing','fulfilled','cancelled'],allowedPay=['pending','paid','refunded','cancelled'];if(!allowedStatus.includes(d.status)||!allowedPay.includes(d.payment_status)){json(res,400,{error:'Invalid order status.'});return;}db.prepare('UPDATE orders SET status=?,payment_status=? WHERE id=?').run(d.status,d.payment_status,Number(m[1]));await persistDatabase();json(res,200,{ok:true});return;
     }
     if(pathname==='/api/admin/settings'&&req.method==='PUT'){
-      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const d=await readJson(req);const allowed=Object.keys(settingDefaults);const up=db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');for(const k of allowed)if(k in d)up.run(k,String(d[k]??''));json(res,200,{ok:true});return;
+      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const d=await readJson(req);const allowed=Object.keys(settingDefaults);const up=db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');for(const k of allowed)if(k in d)up.run(k,String(d[k]??''));await persistDatabase();json(res,200,{ok:true});return;
     }
 
-    html(res,`${publicHeader('Not found')}<main><section class="page-hero"><div class="container"><h1>Page not found.</h1><a class="btn" href="/">Back home</a></div></section></main>${publicFooter()}`,404);
+    html(res,`${publicHeader('Not found',{canonicalPath:pathname,noindex:true})}<main><section class="page-hero"><div class="container"><h1>Page not found.</h1><a class="btn" href="/">Back home</a></div></section></main>${publicFooter()}`,404);
   } catch(err) {
     console.error(err);
     if(!res.headersSent) json(res,500,{error:'Something went wrong.'}); else res.end();
