@@ -41,11 +41,13 @@ function initProductForm() {
     if(!id){toast('Save the product first, then upload images.', true); return;}
     const files=[...uploader.files]; if(!files.length)return;
     uploader.disabled=true;
+    let uploaded=0;
     for(const file of files){
-      try{ const dataUrl=await fileToDataUrl(file); await api(`/api/admin/products/${id}/images`,{method:'POST',body:JSON.stringify({filename:file.name,dataUrl,alt:$('[name=name]',form)?.value||''})}); }
+      try{ const dataUrl=await fileToDataUrl(file); await api(`/api/admin/products/${id}/images`,{method:'POST',body:JSON.stringify({filename:file.name,dataUrl,alt:$('[name=name]',form)?.value||''})}); uploaded++; }
       catch(err){toast(err.message,true)}
     }
-    toast('Images uploaded'); setTimeout(()=>location.reload(),500);
+    uploader.disabled=false;
+    if(uploaded) { toast(`${uploaded} image(s) uploaded`); setTimeout(()=>location.reload(),1500); }
   });
   $$('[data-delete-image]').forEach(btn=>btn.onclick=async()=>{if(!confirm('Delete this image?'))return; try{await api(`/api/admin/images/${btn.dataset.deleteImage}`,{method:'DELETE'});location.reload()}catch(e){toast(e.message,true)}});
   $$('[data-primary-image]').forEach(btn=>btn.onclick=async()=>{try{await api(`/api/admin/images/${btn.dataset.primaryImage}/primary`,{method:'POST',body:'{}'});location.reload()}catch(e){toast(e.message,true)}});

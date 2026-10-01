@@ -126,12 +126,19 @@ function renderCheckout() {
     submit.disabled = true; submit.dataset.original = submit.textContent; submit.textContent = 'Processing…';
     const data = Object.fromEntries(new FormData(form).entries());
     data.items = cart.map(i => ({id:i.id, qty:i.qty}));
+    const fingerprint=JSON.stringify(data);
+    let attempt;
+    try { attempt=JSON.parse(sessionStorage.getItem('isolde_checkout_attempt')||'null'); } catch {}
+    if(!attempt || attempt.fingerprint!==fingerprint) attempt={fingerprint,key:crypto.randomUUID()};
+    sessionStorage.setItem('isolde_checkout_attempt',JSON.stringify(attempt));
+    data.checkout_key=attempt.key;
     try {
       const res = await fetch('/api/orders', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
       const out = await res.json();
       if (!res.ok) throw new Error(out.error || 'Could not place order');
       if (out.checkoutUrl) { location.href = out.checkoutUrl; return; }
       localStorage.removeItem(cartKey); updateCartCount();
+      sessionStorage.removeItem('isolde_checkout_attempt');
       location.href = `/order/success?order=${encodeURIComponent(out.orderNumber)}`;
     } catch (err) {
       toast(err.message); submit.disabled = false; submit.textContent = submit.dataset.original;
@@ -189,6 +196,10 @@ function bindGallery() {
 function escapeHtml(str='') { return String(str).replace(/[&<>'"]/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[m])); }
 
 document.addEventListener('DOMContentLoaded', () => {
+  if(document.querySelector('[data-payment-confirmed]')) {
+    localStorage.removeItem(cartKey);
+    sessionStorage.removeItem('isolde_checkout_attempt');
+  }
   updateCartCount(); bindAddButtons(); renderCartPage(); renderCheckout(); bindShopFilters(); bindGallery();
   const menuBtn = document.querySelector('[data-menu-toggle]');
   const menu = document.querySelector('[data-mobile-menu]');

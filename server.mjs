@@ -4,6 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import { createStorage } from './storage.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const ROOT = path.dirname(__filename);
@@ -35,12 +36,81 @@ const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@isolde.local';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'Isolde123!';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'local-development-secret-change-me';
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const GOOGLE_SITE_VERIFICATION = process.env.GOOGLE_SITE_VERIFICATION || '';
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || '';
+const SUPABASE_DATA_BUCKET = process.env.SUPABASE_DATA_BUCKET || 'isolde-private';
+const SUPABASE_IMAGE_BUCKET = process.env.SUPABASE_IMAGE_BUCKET || 'isolde-images';
+const SUPABASE_ENABLED = !!SUPABASE_URL && !!SUPABASE_SECRET_KEY;
 const DEFAULT_CURRENCY = (process.env.STORE_CURRENCY || 'CAD').toUpperCase();
 const USING_DEFAULT_ADMIN = !process.env.ADMIN_EMAIL || !process.env.ADMIN_PASSWORD || !process.env.SESSION_SECRET;
+const DB_PATH = path.join(DATA, 'isolde.sqlite');
 
-const db = new DatabaseSync(path.join(DATA, 'isolde.sqlite'));
+const PRODUCTION = process.env.NODE_ENV==='production' || !!process.env.RENDER || BASE_URL.startsWith('https://');
+if (!!SUPABASE_URL !== !!SUPABASE_SECRET_KEY) throw new Error('Set both SUPABASE_URL and SUPABASE_SECRET_KEY.');
+if(PRODUCTION && USING_DEFAULT_ADMIN) throw new Error('Set ADMIN_EMAIL, ADMIN_PASSWORD and SESSION_SECRET before publishing.');
+if(PRODUCTION && (['Isolde123!','ChangeMeNow123!'].includes(ADMIN_PASSWORD) || SESSION_SECRET.length<32 || SESSION_SECRET==='replace-with-a-long-random-secret')) throw new Error('Use a unique admin password and a random SESSION_SECRET of at least 32 characters.');
+if(PRODUCTION && (!BASE_URL.startsWith('https://') || new URL(BASE_URL).hostname==='localhost')) throw new Error('BASE_URL must be your public HTTPS domain.');
+if(PRODUCTION && !SUPABASE_ENABLED) throw new Error('Configure Supabase before publishing so products and images survive restarts.');
+if(SUPABASE_ENABLED && SUPABASE_DATA_BUCKET===SUPABASE_IMAGE_BUCKET) throw new Error('Use separate private data and public image buckets.');
+if(SUPABASE_ENABLED && process.env.SUPABASE_SINGLE_INSTANCE!=='true') throw new Error('Set SUPABASE_SINGLE_INSTANCE=true and run only one server instance.');
+if(PRODUCTION && STRIPE_SECRET_KEY && !STRIPE_WEBHOOK_SECRET) throw new Error('Set STRIPE_WEBHOOK_SECRET to enable reliable card payments.');
+const storage=SUPABASE_ENABLED ? createStorage({url:SUPABASE_URL,key:SUPABASE_SECRET_KEY,dataBucket:SUPABASE_DATA_BUCKET,imageBucket:SUPABASE_IMAGE_BUCKET}) : null;
+
+async function uploadStorageObject(bucket, name, bytes, type) {
+  return storage.upload(bucket,name,bytes,type);
+}
+function publicStorageUrl(bucket,name) { return storage.publicUrl(bucket,name); }
+function imageObjectFromUrl(value='') {
+  if(!SUPABASE_ENABLED) return null;
+  const prefix=`${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(SUPABASE_IMAGE_BUCKET)}/`;
+  if(!String(value).startsWith(prefix)) return null;
+  return String(value).slice(prefix.length).split('/').map(x=>decodeURIComponent(x)).join('/');
+}
+if(SUPABASE_ENABLED) await storage.restore(DB_PATH,process.env.SUPABASE_ALLOW_INITIALIZE==='true');
+
+const DATABASE_NEW=!fs.existsSync(DB_PATH);
+const db = new DatabaseSync(DB_PATH);
 db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+let persistChain=Promise.resolve();
+let backupDirty=false;
+function persistDatabase() {
+  if(!SUPABASE_ENABLED) return Promise.resolve();
+  backupDirty=true;
+  const operation=persistChain.catch(()=>{}).then(async()=>{
+    const checkpoint=db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+    if(checkpoint.busy) throw new Error('Database checkpoint is busy.');
+    const bytes=fs.readFileSync(DB_PATH);
+    await uploadStorageObject(SUPABASE_DATA_BUCKET,'isolde.sqlite',bytes,'application/vnd.sqlite3');
+    backupDirty=false;
+  });
+  persistChain=operation;
+  return operation.catch(err=>{
+    console.error('Database backup failed:',err.message);
+    const failure=new Error('Cloud save failed. Changes are kept locally and will be retried. Refresh to check before retrying.');
+    failure.statusCode=503;
+    throw failure;
+  });
+}
+async function uploadProductImage(name, bytes, contentType) {
+  const objectName=`products/${name}`;
+  await uploadStorageObject(SUPABASE_IMAGE_BUCKET,objectName,bytes,contentType);
+  return publicStorageUrl(SUPABASE_IMAGE_BUCKET,objectName);
+}
+async function deleteStoredImage(imagePath) {
+  const remote=imageObjectFromUrl(imagePath);
+  if(remote) {
+    await storage.remove(SUPABASE_IMAGE_BUCKET,remote);
+    return;
+  }
+  if(String(imagePath).startsWith('/uploads/products/')) {
+    const file=path.join(PUBLIC,imagePath);
+    if(fs.existsSync(file)) fs.unlinkSync(file);
+  }
+}
 db.exec(`
+CREATE TABLE IF NOT EXISTS pending_image_deletions (path TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL DEFAULT ''
@@ -118,6 +188,39 @@ function ensureColumn(table, column, definition) {
 }
 ensureColumn('products', 'audience', "TEXT NOT NULL DEFAULT 'Unisex'");
 ensureColumn('products', 'bestseller', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('orders','currency',"TEXT NOT NULL DEFAULT 'CAD'");
+ensureColumn('orders','checkout_key','TEXT');
+ensureColumn('order_items','image',"TEXT NOT NULL DEFAULT ''");
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS orders_checkout_key ON orders(checkout_key) WHERE checkout_key IS NOT NULL');
+
+function queueImageDeletion(imagePath) {
+  db.prepare('INSERT OR IGNORE INTO pending_image_deletions(path) VALUES(?)').run(imagePath);
+}
+async function cleanupImages() {
+  let changed=false;
+  for(const row of db.prepare('SELECT path FROM pending_image_deletions').all()) {
+    if(db.prepare('SELECT id FROM product_images WHERE path=?').get(row.path)) continue;
+    try {
+      await deleteStoredImage(row.path);
+      db.prepare('DELETE FROM pending_image_deletions WHERE path=?').run(row.path);
+      changed=true;
+    } catch(err) { console.error('Image cleanup will retry:',err.message); }
+  }
+  if(changed) await persistDatabase();
+}
+async function migrateLocalImages() {
+  if(!SUPABASE_ENABLED) return;
+  for(const image of db.prepare("SELECT id,path FROM product_images WHERE path LIKE '/uploads/products/%'").all()) {
+    const name=path.basename(image.path);
+    const local=path.join(UPLOADS,name);
+    if(!fs.existsSync(local)) { console.warn(`Old image is missing and must be reuploaded: ${name}`); continue; }
+    const type={'.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.webp':'image/webp'}[path.extname(name).toLowerCase()];
+    if(!type) continue;
+    const remote=await uploadProductImage(name,fs.readFileSync(local),type);
+    db.prepare('UPDATE product_images SET path=? WHERE id=?').run(remote,image.id);
+  }
+}
+
 
 const settingDefaults = {
   brand_name: 'Isolde',
@@ -189,7 +292,7 @@ const seedProducts = [
     category: 'Fresh · Citrus', audience: 'Men', price_cents: 6000, featured: 1, bestseller: 0, sort_order: 9, image: '/uploads/products/summer-creed.webp'
   }
 ];
-if (db.prepare('SELECT COUNT(*) AS n FROM products').get().n === 0) {
+if (DATABASE_NEW) {
   const insP = db.prepare(`INSERT INTO products(slug,name,inspired_by,description,category,audience,price_cents,size_ml,sku,stock,status,featured,bestseller,sort_order)
     VALUES(?,?,?,?,?,?,?,?,'',NULL,'active',?,?,?)`);
   const insI = db.prepare('INSERT INTO product_images(product_id,path,alt,sort_order,is_primary) VALUES(?,?,?,?,1)');
@@ -230,6 +333,9 @@ if (!catalogueMigrated) {
   for (const [slug, description] of Object.entries(launchDescriptions)) setDescription.run(description, slug);
   db.prepare("UPDATE settings SET value='1' WHERE key='catalogue_v2_migrated'").run();
 }
+await migrateLocalImages();
+await persistDatabase();
+await cleanupImages();
 
 function settings() {
   return Object.fromEntries(db.prepare('SELECT key,value FROM settings').all().map(r => [r.key, r.value]));
@@ -252,6 +358,11 @@ function calculateShipping(subtotalCents) {
   return c.flatFeeCents;
 }
 function e(v='') { return String(v ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
+function absoluteAssetUrl(value='') {
+  const v=String(value || '');
+  if(/^https?:\/\//i.test(v)) return v;
+  return `${BASE_URL}${v.startsWith('/')?v:'/'+v}`;
+}
 function money(cents, currency = settings().currency || 'CAD') {
   if (!Number(cents)) return '';
   try { return new Intl.NumberFormat('en-CA', {style:'currency',currency}).format(cents / 100); }
@@ -342,18 +453,34 @@ function getAdminProduct(id) {
   return p;
 }
 
-function baseHead(title, description='') {
+function baseHead(title, description='', options={}) {
   const s=settings();
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e(title)} · ${e(s.brand_name)}</title><meta name="description" content="${e(description || s.hero_subtitle)}"><meta name="theme-color" content="#171512"><link rel="stylesheet" href="/assets/styles.css"><script>window.ISOLDE_CURRENCY=${JSON.stringify(s.currency || 'CAD')};window.ISOLDE_SHIPPING=${JSON.stringify(shippingConfig())}</script><script src="/assets/store.js" defer></script></head><body>`;
+  const isHome=!title || title===s.brand_name;
+  const pageTitle=isHome ? `${s.brand_name} Perfumes | Independent Fragrance House in Canada` : `${title} | ${s.brand_name}`;
+  const metaDescription=String(description || s.hero_subtitle || 'Discover Isolde fragrances, an independent perfume collection in Canada.').trim();
+  const canonicalPath=String(options.canonicalPath || '/');
+  const canonical=`${BASE_URL}${canonicalPath.startsWith('/')?canonicalPath:'/'+canonicalPath}`;
+  const ogImage=absoluteAssetUrl(options.image || '/assets/isolde-logo.png');
+  const robots=options.noindex ? 'noindex,nofollow' : 'index,follow,max-image-preview:large';
+  const organization={
+    "@context":"https://schema.org",
+    "@type":"Organization",
+    name:s.brand_name,
+    url:BASE_URL,
+    logo:absoluteAssetUrl('/assets/isolde-logo.png'),
+    description:metaDescription
+  };
+  if(s.contact_email) organization.email=s.contact_email;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e(pageTitle)}</title><meta name="description" content="${e(metaDescription)}"><meta name="robots" content="${robots}"><link rel="canonical" href="${e(canonical)}"><link rel="icon" type="image/png" href="/assets/isolde-logo.png"><meta name="theme-color" content="#171512"><meta property="og:site_name" content="${e(s.brand_name)}"><meta property="og:type" content="${e(options.type || 'website')}"><meta property="og:title" content="${e(pageTitle)}"><meta property="og:description" content="${e(metaDescription)}"><meta property="og:url" content="${e(canonical)}"><meta property="og:image" content="${e(ogImage)}"><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="${e(pageTitle)}"><meta name="twitter:description" content="${e(metaDescription)}"><meta name="twitter:image" content="${e(ogImage)}">${GOOGLE_SITE_VERIFICATION?`<meta name="google-site-verification" content="${e(GOOGLE_SITE_VERIFICATION)}">`:''}<script type="application/ld+json">${JSON.stringify(organization).replace(/</g,'\\u003c')}</script><link rel="stylesheet" href="/assets/styles.css"><script>window.ISOLDE_CURRENCY=${JSON.stringify(s.currency || 'CAD')};window.ISOLDE_SHIPPING=${JSON.stringify(shippingConfig())}</script><script src="/assets/store.js" defer></script></head><body>`;
 }
-function publicHeader(active='') {
+function publicHeader(active='', seo={}) {
   const s=settings();
-  return `${baseHead(active ? active : s.brand_name)}
+  return `${baseHead(active ? active : s.brand_name, seo.description || '', seo)}
   <div class="announcement">${e(s.announcement)}</div>
   <header class="site-header"><div class="container nav">
     <nav class="nav-links"><a href="/shop">Shop</a><a href="/shop?audience=Women">Women</a><a href="/shop?audience=Men">Men</a><a href="/shop?audience=Unisex">Unisex</a></nav>
     <button class="menu-button" data-menu-toggle aria-label="Menu">☰</button>
-    <a class="brand brand-logo" href="/" aria-label="${e(s.brand_name)} home"><img src="/assets/isolde-logo.png" alt="${e(s.brand_name)}"></a>
+    <a class="brand brand-logo" href="/" aria-label="${e(s.brand_name)} home"><img src="/assets/isolde-logo.png" alt="${e(s.brand_name)} perfume logo"></a>
     <div class="nav-actions"><a href="/about">Our Story</a><a class="bag-pill" href="/cart">Bag <span data-cart-count>0</span></a></div>
   </div><div class="mobile-menu" data-mobile-menu><a href="/shop">Shop all</a><a href="/shop?audience=Women">Women</a><a href="/shop?audience=Men">Men</a><a href="/shop?audience=Unisex">Unisex</a><a href="/about">Our Story</a><a href="/contact">Contact</a></div></header>`;
 }
@@ -386,7 +513,7 @@ function homePage() {
     {audience:'Men',title:'For Him',copy:'Fresh woods, aromatic depth and confident character.',product:all.find(x=>x.slug==='blue-elixir')},
     {audience:'Unisex',title:'Unisex',copy:'Warm, distinctive scents designed beyond labels.',product:all.find(x=>x.slug==='golden-orchid')}
   ].filter(x=>x.product);
-  return `${publicHeader()}<main>
+  return `${publicHeader('',{canonicalPath:'/',description:'Shop Isolde perfumes in Canada. Discover independent fragrances for women, men and unisex wear, with clear scent inspiration and 100 mL bottles.'})}<main>
   <section class="lux-hero"><div class="container lux-hero-grid"><div class="lux-hero-copy"><div class="eyebrow">${e(s.hero_eyebrow)}</div><h1>${e(s.hero_title)}</h1><p class="lead">${e(s.hero_subtitle)}</p><div class="hero-actions"><a class="btn" href="/shop">Shop all fragrances</a><a class="text-link" href="/about">Discover the house →</a></div><div class="hero-facts"><span>100 mL</span><span>9 signature scents</span><span>Independent fragrance house</span></div></div>
   <div class="lux-hero-media"><a class="hero-main-photo" href="/product/${e(heroMain.slug)}"><img src="${e(heroMain.image)}" alt="${e(heroMain.name)}"><div class="image-caption"><span>${e(heroMain.name)}</span><strong>${e(money(heroMain.price_cents))}</strong></div></a><a class="hero-float-photo" href="/product/${e(heroSide.slug)}"><img src="${e(heroSide.image)}" alt="${e(heroSide.name)}"></a></div></div></section>
 
@@ -405,16 +532,17 @@ function homePage() {
 function shopPage() {
   const products=getProducts();
   const cats=[...new Set(products.map(p=>p.category))];
-  return `${publicHeader('Shop')}<main><section class="page-hero shop-hero"><div class="container"><div class="eyebrow">The Isolde Collection</div><h1>Find your signature.</h1><p class="lead">Explore all ${products.length} fragrances by audience, scent family, inspiration or price.</p></div></section>
+  return `${publicHeader('Shop',{canonicalPath:'/shop',description:'Shop the complete Isolde perfume collection in Canada. Browse fragrances for women, men and unisex wear by scent family, inspiration and price.'})}<main><section class="page-hero shop-hero"><div class="container"><div class="eyebrow">The Isolde Collection</div><h1>Find your signature.</h1><p class="lead">Explore all ${products.length} fragrances by audience, scent family, inspiration or price.</p></div></section>
   <section style="padding-top:20px"><div class="container"><div class="shop-toolbar shop-toolbar-4"><input class="field" data-shop-search placeholder="Search fragrances or inspirations…"><select class="select" data-shop-audience><option value="">Women, Men & Unisex</option><option>Women</option><option>Men</option><option>Unisex</option></select><select class="select" data-shop-category><option value="">All scent families</option>${cats.map(c=>`<option>${e(c)}</option>`).join('')}</select><select class="select" data-shop-sort><option value="default">Curated order</option><option value="name">Name A–Z</option><option value="price-asc">Price low to high</option><option value="price-desc">Price high to low</option></select></div><div class="shop-result-line"><span><strong data-shop-count>${products.length}</strong> fragrances</span><a href="/shop">Clear filters</a></div><div class="product-grid" data-shop-grid>${products.map(productCard).join('')}</div></div></section></main>${publicFooter()}`;
 }
 function productPage(p) {
   const s=settings();
   const image=(p.images[0]?.path || '');
   const payload=JSON.stringify({id:p.id,slug:p.slug,name:p.name,inspiredBy:p.inspired_by,image,priceCents:p.price_cents}).replace(/'/g,'&#39;');
-  const jsonLd={"@context":"https://schema.org","@type":"Product",name:p.name,brand:{"@type":"Brand",name:s.brand_name},description:p.description,image:p.images.map(i=>BASE_URL+i.path)};
-  if(p.price_cents>0) jsonLd.offers={"@type":"Offer",priceCurrency:s.currency,price:(p.price_cents/100).toFixed(2),availability:"https://schema.org/InStock"};
-  return `${baseHead(p.name,p.description).replace('</head>',`<script type="application/ld+json">${JSON.stringify(jsonLd).replace(/</g,'\\u003c')}</script></head>`)}
+  const canonicalPath=`/product/${encodeURIComponent(p.slug)}`;
+  const jsonLd={"@context":"https://schema.org","@type":"Product",name:p.name,brand:{"@type":"Brand",name:s.brand_name},description:p.description,image:p.images.map(i=>absoluteAssetUrl(i.path)),sku:p.sku||undefined,url:`${BASE_URL}${canonicalPath}`};
+  if(p.price_cents>0) jsonLd.offers={"@type":"Offer",priceCurrency:s.currency,price:(p.price_cents/100).toFixed(2),availability:p.stock===0?"https://schema.org/OutOfStock":"https://schema.org/InStock",url:`${BASE_URL}${canonicalPath}`,seller:{"@type":"Organization",name:s.brand_name}};
+  return `${baseHead(p.name,p.description,{canonicalPath,image,type:'product'}).replace('</head>',`<script type="application/ld+json">${JSON.stringify(jsonLd).replace(/</g,'\\u003c')}</script></head>`)}
   <div class="announcement">${e(s.announcement)}</div><header class="site-header"><div class="container nav"><nav class="nav-links"><a href="/shop">Shop</a><a href="/shop?audience=Women">Women</a><a href="/shop?audience=Men">Men</a><a href="/shop?audience=Unisex">Unisex</a></nav><button class="menu-button" data-menu-toggle>☰</button><a class="brand brand-logo" href="/" aria-label="${e(s.brand_name)} home"><img src="/assets/isolde-logo.png" alt="${e(s.brand_name)}"></a><div class="nav-actions"><a href="/about">Our Story</a><a class="bag-pill" href="/cart">Bag <span data-cart-count>0</span></a></div></div><div class="mobile-menu" data-mobile-menu><a href="/shop">Shop all</a><a href="/shop?audience=Women">Women</a><a href="/shop?audience=Men">Men</a><a href="/shop?audience=Unisex">Unisex</a><a href="/about">Our Story</a></div></header>
   <main><div class="container product-page"><div><div class="gallery-main"><img src="${e(image)}" alt="${e(p.name)}"></div>${p.images.length>1?`<div class="thumbs">${p.images.map(i=>`<button class="thumb" type="button" data-gallery-thumb data-image="${e(i.path)}"><img src="${e(i.path)}" alt="${e(i.alt)}"></button>`).join('')}</div>`:''}</div>
   <div class="product-detail"><div class="product-detail-topline"><span>${e(p.audience||'Unisex')}</span><span>${e(p.category)}</span></div><h1>${e(p.name)}</h1><div class="inspired-line">Inspired by <strong>${e(p.inspired_by)}</strong></div>${p.price_cents>0?`<div class="detail-price">${e(money(p.price_cents))}</div>`:'<div class="coming" style="margin-top:22px">Price coming soon.</div>'}<p class="product-description">${e(p.description)}</p>
@@ -423,7 +551,7 @@ function productPage(p) {
   <div class="product-meta">${p.size_ml?`<div class="meta-row"><span>Size</span><strong>${p.size_ml} mL</strong></div>`:''}<div class="meta-row"><span>For</span><strong>${e(p.audience||'Unisex')}</strong></div><div class="meta-row"><span>Scent family</span><strong>${e(p.category)}</strong></div>${p.sku?`<div class="meta-row"><span>SKU</span><strong>${e(p.sku)}</strong></div>`:''}</div><p class="small muted" style="margin-top:18px">Independent fragrance interpretation. Not affiliated with or endorsed by the referenced designer brand.</p></div></div></main>${publicFooter()}`;
 }
 function cartPage() {
-  return `${publicHeader('Bag')}<main><section class="page-hero"><div class="container"><div class="eyebrow">Your bag</div><h1>Your Isolde selection.</h1></div></section><section style="padding-top:10px"><div class="container cart-layout"><div><div data-cart-page></div><div data-cart-empty hidden><p class="lead">Your bag is empty.</p><a class="btn" href="/shop">Explore fragrances</a></div></div><aside class="summary-card" data-cart-summary hidden><h3 style="font-size:1.7rem;margin-top:0">Order summary</h3><div class="summary-row"><span>Items</span><span data-cart-items>0</span></div><div class="summary-row"><span>Subtotal</span><strong data-cart-subtotal>—</strong></div><p class="small muted">Shipping and applicable tax are confirmed during checkout.</p><a class="btn" href="/checkout">Continue to checkout</a></aside></div></section></main>${publicFooter()}`;
+  return `${publicHeader('Bag',{canonicalPath:'/cart',noindex:true})}<main><section class="page-hero"><div class="container"><div class="eyebrow">Your bag</div><h1>Your Isolde selection.</h1></div></section><section style="padding-top:10px"><div class="container cart-layout"><div><div data-cart-page></div><div data-cart-empty hidden><p class="lead">Your bag is empty.</p><a class="btn" href="/shop">Explore fragrances</a></div></div><aside class="summary-card" data-cart-summary hidden><h3 style="font-size:1.7rem;margin-top:0">Order summary</h3><div class="summary-row"><span>Items</span><span data-cart-items>0</span></div><div class="summary-row"><span>Subtotal</span><strong data-cart-subtotal>—</strong></div><p class="small muted">Shipping and applicable tax are confirmed during checkout.</p><a class="btn" href="/checkout">Continue to checkout</a></aside></div></section></main>${publicFooter()}`;
 }
 function checkoutPage() {
   const s=settings();
@@ -431,10 +559,10 @@ function checkoutPage() {
   const stripeReady=!!STRIPE_SECRET_KEY && ship.mode!=='quote';
   const payCopy = stripeReady ? 'Continue to secure payment' : 'Place order request';
   const helper = stripeReady ? 'Payment is completed securely through Stripe. Shipping is calculated from your store settings.' : (STRIPE_SECRET_KEY && ship.mode==='quote' ? 'Stripe is connected, but shipping is still set to “Quote after order.” Set a flat or free shipping method in Admin → Settings to charge cards automatically.' : 'The order will be saved in your Isolde admin dashboard for payment and shipping follow-up.');
-  return `${publicHeader('Checkout')}<main><section class="page-hero"><div class="container"><div class="eyebrow">Checkout</div><h1>Complete your order.</h1></div></section><section style="padding-top:8px"><div class="container checkout-grid"><form data-checkout-form><div class="form-grid"><div class="form-group"><label>First & last name</label><input name="customer_name" required></div><div class="form-group"><label>Email</label><input type="email" name="email" required></div><div class="form-group"><label>Phone</label><input type="tel" name="phone"></div><div class="form-group"><label>Country</label><input name="country" value="${e(ship.countries[0]||'Canada')}" required></div><div class="form-group span-2"><label>Address</label><input name="address1" required></div><div class="form-group span-2"><label>Apartment / suite (optional)</label><input name="address2"></div><div class="form-group"><label>City</label><input name="city" required></div><div class="form-group"><label>Province / state</label><input name="province" required></div><div class="form-group"><label>Postal / ZIP code</label><input name="postal_code" required></div><div class="form-group span-2"><label>Order note (optional)</label><textarea name="notes" rows="3"></textarea></div></div><button class="btn" type="submit" style="margin-top:22px">${payCopy}</button><p class="small muted">${e(helper)}</p></form><aside class="summary-card"><h3 style="font-size:1.7rem;margin-top:0">Order summary</h3><div data-checkout-items class="checkout-lines"></div><div class="summary-row" style="margin-top:12px"><span>Subtotal</span><strong data-checkout-subtotal>—</strong></div><div class="summary-row"><span>Shipping</span><strong data-checkout-shipping>—</strong></div><div class="summary-row checkout-total"><span>Total</span><strong data-checkout-total>—</strong></div><p class="small muted">${e(s.shipping_note)}</p></aside></div></section></main>${publicFooter()}`;
+  return `${publicHeader('Checkout',{canonicalPath:'/checkout',noindex:true})}<main><section class="page-hero"><div class="container"><div class="eyebrow">Checkout</div><h1>Complete your order.</h1></div></section><section style="padding-top:8px"><div class="container checkout-grid"><form data-checkout-form><div class="form-grid"><div class="form-group"><label>First & last name</label><input name="customer_name" required></div><div class="form-group"><label>Email</label><input type="email" name="email" required></div><div class="form-group"><label>Phone</label><input type="tel" name="phone"></div><div class="form-group"><label>Country</label><input name="country" value="${e(ship.countries[0]||'Canada')}" required></div><div class="form-group span-2"><label>Address</label><input name="address1" required></div><div class="form-group span-2"><label>Apartment / suite (optional)</label><input name="address2"></div><div class="form-group"><label>City</label><input name="city" required></div><div class="form-group"><label>Province / state</label><input name="province" required></div><div class="form-group"><label>Postal / ZIP code</label><input name="postal_code" required></div><div class="form-group span-2"><label>Order note (optional)</label><textarea name="notes" rows="3"></textarea></div></div><button class="btn" type="submit" style="margin-top:22px">${payCopy}</button><p class="small muted">${e(helper)}</p></form><aside class="summary-card"><h3 style="font-size:1.7rem;margin-top:0">Order summary</h3><div data-checkout-items class="checkout-lines"></div><div class="summary-row" style="margin-top:12px"><span>Subtotal</span><strong data-checkout-subtotal>—</strong></div><div class="summary-row"><span>Shipping</span><strong data-checkout-shipping>—</strong></div><div class="summary-row checkout-total"><span>Total</span><strong data-checkout-total>—</strong></div><p class="small muted">${e(s.shipping_note)}</p></aside></div></section></main>${publicFooter()}`;
 }
 function successPage(orderNo, paid=false) {
-  return `${publicHeader('Order received')}<main><section class="page-hero"><div class="container info-page"><div class="eyebrow">${paid?'Payment confirmed':'Order received'}</div><h1>Thank you.</h1><p class="lead">Your Isolde order <strong>${e(orderNo || '')}</strong> has been received${paid?' and payment has been confirmed':''}.</p><p>We’ll use the contact details on the order to provide the next update.</p><a class="btn" href="/shop">Continue shopping</a></div></section></main>${publicFooter()}`;
+  return `${publicHeader('Order received',{canonicalPath:'/order/success',noindex:true})}<main ${paid?'data-payment-confirmed':''}><section class="page-hero"><div class="container info-page"><div class="eyebrow">${paid?'Payment confirmed':'Order received'}</div><h1>Thank you.</h1><p class="lead">Your Isolde order <strong>${e(orderNo || '')}</strong> has been received${paid?' and payment has been confirmed':''}.</p><p>We’ll use the contact details on the order to provide the next update.</p><a class="btn" href="/shop">Continue shopping</a></div></section></main>${publicFooter()}`;
 }
 function infoPage(kind) {
   const s=settings();
@@ -446,11 +574,11 @@ function infoPage(kind) {
     privacy:["Privacy",`This starter store collects the information required to process orders, including customer name, contact details and shipping address.`, `If Stripe is enabled, payment card information is handled by Stripe rather than stored in the Isolde database.`, `Before public launch, update this page to reflect your actual analytics, email-marketing and cookie tools.`],
     terms:["Terms",`Product images and descriptions are provided for shopping and product-identification purposes.`, `Designer fragrance names are used only as comparative references to describe scent inspiration. Isolde is an independent brand and is not affiliated with or endorsed by those trademark owners.`, `Before public launch, have your final terms reviewed for your jurisdiction and business model.`]
   }[kind];
-  return `${publicHeader(content[0])}<main><section class="page-hero"><div class="container info-page"><div class="eyebrow">Isolde</div><h1>${e(content[0])}</h1>${content.slice(1).map((p,i)=>`<p class="${i===0?'lead':''}" style="white-space:pre-line">${e(p)}</p>`).join('')}</div></section></main>${publicFooter()}`;
+  return `${publicHeader(content[0],{canonicalPath:`/${kind}`,description:content[1]})}<main><section class="page-hero"><div class="container info-page"><div class="eyebrow">Isolde</div><h1>${e(content[0])}</h1>${content.slice(1).map((p,i)=>`<p class="${i===0?'lead':''}" style="white-space:pre-line">${e(p)}</p>`).join('')}</div></section></main>${publicFooter()}`;
 }
 
 function adminHead(title, csrf='') {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e(title)} · Isolde Admin</title><meta name="csrf-token" content="${e(csrf)}"><link rel="stylesheet" href="/assets/styles.css"><script src="/assets/admin.js" defer></script></head><body class="admin-body">`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e(title)} · Isolde Admin</title><meta name="robots" content="noindex,nofollow"><meta name="csrf-token" content="${e(csrf)}"><link rel="stylesheet" href="/assets/styles.css"><script src="/assets/admin.js" defer></script></head><body class="admin-body">`;
 }
 function adminLayout(title, body, session, active='') {
   return `${adminHead(title,session.csrf)}<div class="admin-shell"><aside class="admin-side"><a class="brand" href="/admin">Isolde</a>${[['Dashboard','/admin','dashboard'],['Products','/admin/products','products'],['Orders','/admin/orders','orders'],['Settings','/admin/settings','settings']].map(([n,h,k])=>`<a class="${active===k?'active':''}" href="${h}">${n}</a>`).join('')}<a href="/" target="_blank">View store ↗</a><form method="post" action="/admin/logout" style="margin-top:18px"><button style="background:transparent;border:0;color:#cfc6b9;padding:10px 12px">Sign out</button></form></aside><main class="admin-main">${USING_DEFAULT_ADMIN?'<div class="error-box" style="margin-bottom:18px">Default local admin credentials are active. Set ADMIN_EMAIL, ADMIN_PASSWORD and SESSION_SECRET in a .env file before publishing this site.</div>':''}${body}</main></div></body></html>`;
@@ -522,55 +650,78 @@ function serveStatic(req,res,pathname) {
 function orderNumber() {
   const d=new Date();
   const y=String(d.getFullYear()).slice(-2), m=String(d.getMonth()+1).padStart(2,'0'), day=String(d.getDate()).padStart(2,'0');
-  return `IS-${y}${m}${day}-${crypto.randomInt(1000,9999)}`;
+  return `IS-${y}${m}${day}-${crypto.randomBytes(6).toString('hex')}`;
 }
 async function createStripeSession(order, items) {
   const params=new URLSearchParams();
   params.set('mode','payment');
+  params.set('locale','auto');
+  params.set('billing_address_collection','auto');
+  params.set('payment_method_types[0]','card');
+  params.set('client_reference_id',order.order_number);
   params.set('success_url',`${BASE_URL}/order/success?order=${encodeURIComponent(order.order_number)}&session_id={CHECKOUT_SESSION_ID}`);
   params.set('cancel_url',`${BASE_URL}/checkout`);
   params.set('customer_email',order.email);
   params.set('metadata[order_id]',String(order.id));
   params.set('metadata[order_number]',order.order_number);
+  params.set('payment_intent_data[metadata][order_id]',String(order.id));
+  params.set('payment_intent_data[metadata][order_number]',order.order_number);
   items.forEach((item,i)=>{
     params.set(`line_items[${i}][quantity]`,String(item.qty));
-    params.set(`line_items[${i}][price_data][currency]`,(settings().currency||'CAD').toLowerCase());
+    params.set(`line_items[${i}][price_data][currency]`,order.currency.toLowerCase());
     params.set(`line_items[${i}][price_data][unit_amount]`,String(item.unit_price_cents));
     params.set(`line_items[${i}][price_data][product_data][name]`,item.name);
+    if(item.image) params.set(`line_items[${i}][price_data][product_data][images][0]`,absoluteAssetUrl(item.image));
   });
   if (Number(order.shipping_cents||0) > 0) {
     const i=items.length;
     params.set(`line_items[${i}][quantity]`,'1');
-    params.set(`line_items[${i}][price_data][currency]`,(settings().currency||'CAD').toLowerCase());
+    params.set(`line_items[${i}][price_data][currency]`,order.currency.toLowerCase());
     params.set(`line_items[${i}][price_data][unit_amount]`,String(order.shipping_cents));
     params.set(`line_items[${i}][price_data][product_data][name]`,'Shipping');
   }
-  const response=await fetch('https://api.stripe.com/v1/checkout/sessions',{method:'POST',headers:{Authorization:`Bearer ${STRIPE_SECRET_KEY}`,'Content-Type':'application/x-www-form-urlencoded'},body:params});
+  const response=await fetch('https://api.stripe.com/v1/checkout/sessions',{method:'POST',headers:{Authorization:`Bearer ${STRIPE_SECRET_KEY}`,'Content-Type':'application/x-www-form-urlencoded','Idempotency-Key':`isolde-checkout-${order.order_number}`},body:params,signal:AbortSignal.timeout(20000)});
   const data=await response.json();
   if(!response.ok) throw new Error(data.error?.message || 'Stripe checkout could not be created');
   return data;
 }
-async function verifyStripeSuccess(sessionId) {
-  if(!STRIPE_SECRET_KEY || !sessionId) return false;
-  const response=await fetch(`https://api.stripe.com/v1/checkout/sessions/${encodeURIComponent(sessionId)}`,{headers:{Authorization:`Bearer ${STRIPE_SECRET_KEY}`}});
-  if(!response.ok) return false;
-  const data=await response.json();
-  if(data.payment_status==='paid') {
-    const orderId=Number(data.metadata?.order_id || 0);
-    if(orderId) db.prepare("UPDATE orders SET payment_status='paid', status=CASE WHEN status='new' THEN 'processing' ELSE status END WHERE id=?").run(orderId);
-    return true;
+function applyStripePayment(data, expectedOrder='') {
+  if(data.payment_status!=='paid') return false;
+  const order=db.prepare('SELECT * FROM orders WHERE stripe_session_id=?').get(data.id);
+  if(!order || (expectedOrder && order.order_number!==expectedOrder) ||
+     String(order.id)!==String(data.metadata?.order_id) || order.order_number!==data.metadata?.order_number ||
+     order.order_number!==data.client_reference_id || data.mode!=='payment' ||
+     Number(data.amount_total)!==order.total_cents || String(data.currency).toUpperCase()!==order.currency) {
+    throw new Error('Stripe payment does not match a saved order.');
   }
-  return false;
+  db.prepare("UPDATE orders SET payment_status='paid', status=CASE WHEN status='new' THEN 'processing' ELSE status END WHERE id=? AND payment_status='pending'").run(order.id);
+  return true;
+}
+async function verifyStripeSuccess(sessionId,orderNo) {
+  if(!STRIPE_SECRET_KEY || !sessionId || !orderNo) return false;
+  const response=await fetch(`https://api.stripe.com/v1/checkout/sessions/${encodeURIComponent(sessionId)}`,{headers:{Authorization:`Bearer ${STRIPE_SECRET_KEY}`},signal:AbortSignal.timeout(20000)});
+  if(!response.ok) return false;
+  const paid=applyStripePayment(await response.json(),orderNo);
+  if(paid) await persistDatabase();
+  return paid;
+}
+function verifiedStripeEvent(raw,header='') {
+  const values=String(header).split(',').map(part=>part.split('='));
+  const timestamp=values.find(([key])=>key==='t')?.[1];
+  if(!timestamp || !/^\d+$/.test(timestamp) || Math.abs(Date.now()/1000-Number(timestamp))>300) throw new Error('Invalid webhook timestamp.');
+  const expected=crypto.createHmac('sha256',STRIPE_WEBHOOK_SECRET).update(timestamp+'.').update(raw).digest('hex');
+  if(!values.some(([key,value])=>key==='v1' && /^[a-f0-9]{64}$/i.test(value||'') && safeEqual(expected,value))) throw new Error('Invalid webhook signature.');
+  return JSON.parse(raw.toString('utf8'));
 }
 
-const server=http.createServer(async (req,res)=>{
+async function handleRequest(req,res) {
   try {
     const url=new URL(req.url,BASE_URL);
     const pathname=url.pathname;
     if ((pathname.startsWith('/assets/') || pathname.startsWith('/uploads/')) && serveStatic(req,res,pathname)) return;
     if(req.method==='GET' && pathname==='/'){html(res,homePage());return;}
     if(req.method==='GET' && pathname==='/shop'){html(res,shopPage());return;}
-    if(req.method==='GET' && pathname.startsWith('/product/')){const p=getProductBySlug(decodeURIComponent(pathname.slice(9))); if(!p){html(res,'Not found',404);return;} html(res,productPage(p));return;}
+    if(req.method==='GET' && pathname.startsWith('/product/')){const p=getProductBySlug(decodeURIComponent(pathname.slice(9))); if(!p){html(res,baseHead('Not found','',{canonicalPath:pathname,noindex:true})+'<h1>Product not found</h1></body></html>',404);return;} html(res,productPage(p));return;}
     if(req.method==='GET' && pathname==='/cart'){html(res,cartPage());return;}
     if(req.method==='GET' && pathname==='/checkout'){html(res,checkoutPage());return;}
     if(req.method==='GET' && pathname==='/about'){html(res,infoPage('about'));return;}
@@ -580,43 +731,88 @@ const server=http.createServer(async (req,res)=>{
     if(req.method==='GET' && pathname==='/privacy'){html(res,infoPage('privacy'));return;}
     if(req.method==='GET' && pathname==='/terms'){html(res,infoPage('terms'));return;}
     if(req.method==='GET' && pathname==='/api/products'){json(res,200,getProducts());return;}
-    if(req.method==='GET' && pathname==='/robots.txt'){text(res,`User-agent: *\nAllow: /\nSitemap: ${BASE_URL}/sitemap.xml\n`);return;}
+    if(req.method==='GET' && pathname==='/robots.txt'){text(res,`User-agent: *\nAllow: /\nDisallow: /admin\nDisallow: /api/\nDisallow: /cart\nDisallow: /checkout\nDisallow: /order/\nSitemap: ${BASE_URL}/sitemap.xml\n`);return;}
     if(req.method==='GET' && pathname==='/sitemap.xml'){
-      const urls=['/','/shop','/about','/contact',...getProducts().map(p=>'/product/'+p.slug)];
-      text(res,`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.map(x=>`<url><loc>${BASE_URL}${x}</loc></url>`).join('')}</urlset>`,'application/xml; charset=utf-8');return;
+      const urls=['/','/shop','/about','/contact',...getProducts().map(p=>'/product/'+encodeURIComponent(p.slug))];
+      text(res,`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.map(x=>`<url><loc>${e(BASE_URL+x)}</loc></url>`).join('')}</urlset>`,'application/xml; charset=utf-8');return;
+    }
+    if(req.method==='POST' && pathname==='/api/stripe/webhook') {
+      if(!STRIPE_WEBHOOK_SECRET) { json(res,503,{error:'Webhook is not configured.'}); return; }
+      let event;
+      try { event=verifiedStripeEvent(await readBody(req,1024*1024),req.headers['stripe-signature']); }
+      catch { json(res,400,{error:'Invalid webhook.'}); return; }
+      if(['checkout.session.completed','checkout.session.async_payment_succeeded'].includes(event.type)) {
+        if(applyStripePayment(event.data.object)) await persistDatabase();
+      }
+      json(res,200,{received:true}); return;
     }
     if(req.method==='POST' && pathname==='/api/orders'){
       const data=await readJson(req);
       const required=['customer_name','email','address1','city','province','postal_code','country'];
       for(const k of required) if(!String(data[k]||'').trim()){json(res,400,{error:`${k.replaceAll('_',' ')} is required.`});return;}
       if(!Array.isArray(data.items)||!data.items.length){json(res,400,{error:'Your bag is empty.'});return;}
+      const checkoutKey=String(data.checkout_key||'');
+      if(!/^[a-f0-9-]{36}$/i.test(checkoutKey)) {json(res,400,{error:'Refresh checkout and try again.'});return;}
+      if(!shippingConfig().countries.some(country=>country.toLowerCase()===String(data.country).trim().toLowerCase())) {json(res,400,{error:'Shipping is not available to this country.'});return;}
+      let order=db.prepare('SELECT * FROM orders WHERE checkout_key=?').get(checkoutKey);
       const resolved=[]; let subtotal=0;
-      for(const raw of data.items){const p=db.prepare("SELECT * FROM products WHERE id=? AND status='active'").get(Number(raw.id)); const qty=Math.max(1,Math.min(20,Number(raw.qty)||1)); if(!p||p.price_cents<=0){json(res,400,{error:'One or more products are not currently available for online checkout.'});return;} resolved.push({product_id:p.id,name:p.name,qty,unit_price_cents:p.price_cents}); subtotal += p.price_cents*qty;}
-      const shipping=calculateShipping(subtotal);
-      const stripeReady=!!STRIPE_SECRET_KEY && shipping!==null;
-      const orderNo=orderNumber(); const method=stripeReady?'stripe':'manual';
-      const shippingCents=shipping===null?0:shipping;
-      const total=subtotal+shippingCents;
-      const r=db.prepare(`INSERT INTO orders(order_number,customer_name,email,phone,address1,address2,city,province,postal_code,country,subtotal_cents,shipping_cents,total_cents,status,payment_status,payment_method,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'new','pending',?,?)`).run(orderNo,String(data.customer_name).trim(),String(data.email).trim(),String(data.phone||'').trim(),String(data.address1).trim(),String(data.address2||'').trim(),String(data.city).trim(),String(data.province).trim(),String(data.postal_code).trim(),String(data.country).trim(),subtotal,shippingCents,total,method,String(data.notes||'').trim());
-      const orderId=Number(r.lastInsertRowid); const ins=db.prepare('INSERT INTO order_items(order_id,product_id,name,qty,unit_price_cents) VALUES(?,?,?,?,?)'); resolved.forEach(i=>ins.run(orderId,i.product_id,i.name,i.qty,i.unit_price_cents));
-      if(stripeReady){
-        try { const session=await createStripeSession({id:orderId,order_number:orderNo,email:data.email,shipping_cents:shippingCents},resolved); db.prepare('UPDATE orders SET stripe_session_id=? WHERE id=?').run(session.id,orderId); json(res,200,{orderNumber:orderNo,checkoutUrl:session.url,shippingCents,totalCents:total}); }
-        catch(err){ db.prepare("UPDATE orders SET payment_method='manual' WHERE id=?").run(orderId); json(res,200,{orderNumber:orderNo,warning:'Stripe checkout was unavailable, so the order was saved for manual follow-up.',shippingCents,totalCents:total}); }
-      } else json(res,200,{orderNumber:orderNo,shippingCents:shipping,totalCents:shipping===null?null:total});
+      if(order) {
+        if(order.email!==String(data.email).trim()) {json(res,400,{error:'Start a new checkout.'});return;}
+        if(order.payment_status==='paid') {await persistDatabase();json(res,200,{orderNumber:order.order_number});return;}
+        resolved.push(...db.prepare('SELECT * FROM order_items WHERE order_id=?').all(order.id));
+        subtotal=order.subtotal_cents;
+      } else {
+        const quantities=new Map();
+        for(const raw of data.items) {
+          const id=Number(raw.id),qty=Number(raw.qty);
+          if(!Number.isSafeInteger(id)||!Number.isSafeInteger(qty)||qty<1||qty>20) {json(res,400,{error:'Product quantities must be whole numbers from 1 to 20.'});return;}
+          quantities.set(id,(quantities.get(id)||0)+qty);
+        }
+        for(const [id,qty] of quantities) {
+          const p=db.prepare("SELECT * FROM products WHERE id=? AND status='active'").get(id);
+          if(!p || p.price_cents<=0 || qty>20 || (p.stock!==null && qty>p.stock)) {json(res,400,{error:'One or more products are unavailable in the requested quantity.'});return;}
+          const image=db.prepare('SELECT path FROM product_images WHERE product_id=? ORDER BY is_primary DESC,sort_order,id LIMIT 1').get(p.id)?.path||'';
+          resolved.push({product_id:p.id,name:p.name,qty,unit_price_cents:p.price_cents,image});
+          subtotal+=p.price_cents*qty;
+        }
+      }
+      if(!order) {
+        const shipping=calculateShipping(subtotal);
+        const stripeReady=!!STRIPE_SECRET_KEY && shipping!==null;
+        db.exec('BEGIN');
+        try {
+          const r=db.prepare(`INSERT INTO orders(order_number,customer_name,email,phone,address1,address2,city,province,postal_code,country,subtotal_cents,shipping_cents,total_cents,status,payment_status,payment_method,notes,currency,checkout_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'new','pending',?,?,?,?)`).run(orderNumber(),String(data.customer_name).trim(),String(data.email).trim(),String(data.phone||'').trim(),String(data.address1).trim(),String(data.address2||'').trim(),String(data.city).trim(),String(data.province).trim(),String(data.postal_code).trim(),String(data.country).trim(),subtotal,shipping??0,subtotal+(shipping??0),stripeReady?'stripe':'manual',String(data.notes||'').trim(),settings().currency||'CAD',checkoutKey);
+          const orderId=Number(r.lastInsertRowid);
+          const ins=db.prepare('INSERT INTO order_items(order_id,product_id,name,qty,unit_price_cents,image) VALUES(?,?,?,?,?,?)');
+          resolved.forEach(i=>ins.run(orderId,i.product_id,i.name,i.qty,i.unit_price_cents,i.image||''));
+          db.exec('COMMIT');
+          order=db.prepare('SELECT * FROM orders WHERE id=?').get(orderId);
+        } catch(err) { db.exec('ROLLBACK'); throw err; }
+      }
+      // Persist the order before sending the customer to payment.
+      await persistDatabase();
+      if(order.payment_method==='stripe') {
+        let session;
+        try { session=await createStripeSession(order,resolved); }
+        catch(err) { console.error('Stripe checkout failed:',err.message);json(res,502,{error:'Payment checkout is temporarily unavailable. Your bag is saved; please retry.'});return; }
+        db.prepare('UPDATE orders SET stripe_session_id=? WHERE id=?').run(session.id,order.id);
+        await persistDatabase();
+        json(res,200,{orderNumber:order.order_number,checkoutUrl:session.url,shippingCents:order.shipping_cents,totalCents:order.total_cents});
+      } else json(res,200,{orderNumber:order.order_number});
       return;
     }
     if(req.method==='GET' && pathname==='/order/success'){
       const orderNo=url.searchParams.get('order')||''; const sid=url.searchParams.get('session_id')||''; let paid=false;
-      if(sid) paid=await verifyStripeSuccess(sid);
+      if(sid) paid=await verifyStripeSuccess(sid,orderNo);
       html(res,successPage(orderNo,paid));return;
     }
 
     // Admin authentication
     if(req.method==='GET' && pathname==='/admin/login'){ if(adminSession(req)){redirect(res,'/admin');return;} html(res,adminLogin());return; }
     if(req.method==='POST' && pathname==='/admin/login'){
-      const f=await readForm(req); if(safeEqual(f.email||'',ADMIN_EMAIL) && safeEqual(f.password||'',ADMIN_PASSWORD)){const s=newSession(); res.writeHead(302,{Location:'/admin','Set-Cookie':`isolde_admin=${s.id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200${BASE_URL.startsWith('https://')?'; Secure':''}`});res.end();} else html(res,adminLogin('Incorrect email or password.'),401); return;
+      const f=await readForm(req); if(safeEqual(f.email||'',ADMIN_EMAIL) && safeEqual(f.password||'',ADMIN_PASSWORD)){const s=newSession(); await persistDatabase(); res.writeHead(302,{Location:'/admin','Set-Cookie':`isolde_admin=${s.id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=43200${BASE_URL.startsWith('https://')?'; Secure':''}`});res.end();} else html(res,adminLogin('Incorrect email or password.'),401); return;
     }
-    if(req.method==='POST' && pathname==='/admin/logout'){const s=adminSession(req);if(s)db.prepare('DELETE FROM sessions WHERE id=?').run(s.id);res.writeHead(302,{Location:'/admin/login','Set-Cookie':'isolde_admin=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'});res.end();return;}
+    if(req.method==='POST' && pathname==='/admin/logout'){const s=adminSession(req);if(s){db.prepare('DELETE FROM sessions WHERE id=?').run(s.id);await persistDatabase();}res.writeHead(302,{Location:'/admin/login','Set-Cookie':'isolde_admin=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'});res.end();return;}
 
     if(pathname==='/admin'&&req.method==='GET'){const s=requireAdmin(req,res);if(!s)return;html(res,adminDashboard(s));return;}
     if(pathname==='/admin/products'&&req.method==='GET'){const s=requireAdmin(req,res);if(!s)return;html(res,adminProducts(s));return;}
@@ -629,37 +825,80 @@ const server=http.createServer(async (req,res)=>{
     // Admin APIs
     if(pathname==='/api/admin/products'&&req.method==='POST'){
       const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired. Refresh and try again.'});return;}const d=await readJson(req);const name=String(d.name||'').trim(), slug=slugify(d.slug||name);if(!name||!slug){json(res,400,{error:'Name and slug are required.'});return;}
-      try{const audience=['Women','Men','Unisex'].includes(d.audience)?d.audience:'Unisex';const r=db.prepare(`INSERT INTO products(slug,name,inspired_by,description,category,audience,price_cents,compare_at_cents,size_ml,sku,stock,status,featured,bestseller,sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(slug,name,String(d.inspired_by||''),String(d.description||''),String(d.category||'Signature'),audience,Number(d.price||0),d.compare_at_price==null?null:Number(d.compare_at_price),d.size_ml==null?null:Number(d.size_ml),String(d.sku||''),d.stock==null?null:Number(d.stock),d.status==='active'?'active':'draft',d.featured?1:0,d.bestseller?1:0,Number(d.sort_order||50));json(res,200,{id:Number(r.lastInsertRowid)});}catch(err){json(res,400,{error:String(err.message).includes('UNIQUE')?'That URL slug already exists.':err.message});}return;
+      try{const audience=['Women','Men','Unisex'].includes(d.audience)?d.audience:'Unisex';const r=db.prepare(`INSERT INTO products(slug,name,inspired_by,description,category,audience,price_cents,compare_at_cents,size_ml,sku,stock,status,featured,bestseller,sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(slug,name,String(d.inspired_by||''),String(d.description||''),String(d.category||'Signature'),audience,Number(d.price||0),d.compare_at_price==null?null:Number(d.compare_at_price),d.size_ml==null?null:Number(d.size_ml),String(d.sku||''),d.stock==null?null:Number(d.stock),d.status==='active'?'active':'draft',d.featured?1:0,d.bestseller?1:0,Number(d.sort_order||50));await persistDatabase();json(res,200,{id:Number(r.lastInsertRowid)});}catch(err){json(res,err.statusCode||400,{error:String(err.message).includes('UNIQUE')?'That URL slug already exists.':err.message});}return;
     }
     m=pathname.match(/^\/api\/admin\/products\/(\d+)$/); if(m&&req.method==='PUT'){
       const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const id=Number(m[1]),d=await readJson(req);const name=String(d.name||'').trim(),slug=slugify(d.slug||name);if(!name||!slug){json(res,400,{error:'Name and slug are required.'});return;}
-      try{const audience=['Women','Men','Unisex'].includes(d.audience)?d.audience:'Unisex';db.prepare(`UPDATE products SET slug=?,name=?,inspired_by=?,description=?,category=?,audience=?,price_cents=?,compare_at_cents=?,size_ml=?,sku=?,stock=?,status=?,featured=?,bestseller=?,sort_order=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(slug,name,String(d.inspired_by||''),String(d.description||''),String(d.category||'Signature'),audience,Number(d.price||0),d.compare_at_price==null?null:Number(d.compare_at_price),d.size_ml==null?null:Number(d.size_ml),String(d.sku||''),d.stock==null?null:Number(d.stock),d.status==='active'?'active':'draft',d.featured?1:0,d.bestseller?1:0,Number(d.sort_order||50),id);json(res,200,{ok:true});}catch(err){json(res,400,{error:String(err.message).includes('UNIQUE')?'That URL slug already exists.':err.message});}return;
+      try{const audience=['Women','Men','Unisex'].includes(d.audience)?d.audience:'Unisex';db.prepare(`UPDATE products SET slug=?,name=?,inspired_by=?,description=?,category=?,audience=?,price_cents=?,compare_at_cents=?,size_ml=?,sku=?,stock=?,status=?,featured=?,bestseller=?,sort_order=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`).run(slug,name,String(d.inspired_by||''),String(d.description||''),String(d.category||'Signature'),audience,Number(d.price||0),d.compare_at_price==null?null:Number(d.compare_at_price),d.size_ml==null?null:Number(d.size_ml),String(d.sku||''),d.stock==null?null:Number(d.stock),d.status==='active'?'active':'draft',d.featured?1:0,d.bestseller?1:0,Number(d.sort_order||50),id);await persistDatabase();json(res,200,{ok:true});}catch(err){json(res,err.statusCode||400,{error:String(err.message).includes('UNIQUE')?'That URL slug already exists.':err.message});}return;
     }
     if(m&&req.method==='DELETE'){
-      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const id=Number(m[1]);const imgs=db.prepare('SELECT path FROM product_images WHERE product_id=?').all(id);db.prepare('DELETE FROM products WHERE id=?').run(id);for(const img of imgs){if(img.path.startsWith('/uploads/products/')){const f=path.join(PUBLIC,img.path);try{if(fs.existsSync(f))fs.unlinkSync(f)}catch{}}}json(res,200,{ok:true});return;
+      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const id=Number(m[1]);const imgs=db.prepare('SELECT path FROM product_images WHERE product_id=?').all(id);db.prepare('DELETE FROM products WHERE id=?').run(id);for(const img of imgs) queueImageDeletion(img.path);await persistDatabase();await cleanupImages();json(res,200,{ok:true});return;
     }
     m=pathname.match(/^\/api\/admin\/products\/(\d+)\/images$/); if(m&&req.method==='POST'){
-      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const productId=Number(m[1]);if(!db.prepare('SELECT id FROM products WHERE id=?').get(productId)){json(res,404,{error:'Product not found'});return;}const d=await readJson(req);const match=String(d.dataUrl||'').match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/);if(!match){json(res,400,{error:'Please upload a PNG, JPG or WebP image.'});return;}const buf=Buffer.from(match[2],'base64');if(buf.length>10*1024*1024){json(res,400,{error:'Image must be under 10 MB.'});return;}const ext=match[1]==='image/png'?'.png':match[1]==='image/webp'?'.webp':'.jpg';const name=`p${productId}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`;fs.writeFileSync(path.join(UPLOADS,name),buf);const count=db.prepare('SELECT COUNT(*) n FROM product_images WHERE product_id=?').get(productId).n;const r=db.prepare('INSERT INTO product_images(product_id,path,alt,sort_order,is_primary) VALUES(?,?,?,?,?)').run(productId,`/uploads/products/${name}`,String(d.alt||''),count,count===0?1:0);json(res,200,{id:Number(r.lastInsertRowid),path:`/uploads/products/${name}`});return;
+      const session=requireAdmin(req,res,{api:true});if(!session)return;
+      if(!verifyCsrf(req,session)){json(res,403,{error:'Security token expired.'});return;}
+      const productId=Number(m[1]);
+      if(!db.prepare('SELECT id FROM products WHERE id=?').get(productId)){json(res,404,{error:'Product not found'});return;}
+      const data=await readJson(req);
+      const match=String(data.dataUrl||'').match(/^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]+={0,2})$/);
+      if(!match){json(res,400,{error:'Please upload a PNG, JPG or WebP image.'});return;}
+      const bytes=Buffer.from(match[2],'base64');
+      if(bytes.length>10*1024*1024){json(res,400,{error:'Image must be under 10 MB.'});return;}
+      const type=match[1];
+      const valid=type==='image/png' ? bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10])) :
+        type==='image/jpeg' ? bytes.subarray(0,3).equals(Buffer.from([255,216,255])) :
+        bytes.subarray(0,4).toString()==='RIFF' && bytes.subarray(8,12).toString()==='WEBP';
+      if(!valid){json(res,400,{error:'The file is not a valid PNG, JPG or WebP image.'});return;}
+      const ext=type==='image/png'?'.png':type==='image/webp'?'.webp':'.jpg';
+      const name=`p${productId}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`;
+      const imagePath=SUPABASE_ENABLED ? await uploadProductImage(name,bytes,type) : `/uploads/products/${name}`;
+      if(!SUPABASE_ENABLED) fs.writeFileSync(path.join(UPLOADS,name),bytes);
+      let result;
+      try {
+        const count=db.prepare('SELECT COUNT(*) n FROM product_images WHERE product_id=?').get(productId).n;
+        result=db.prepare('INSERT INTO product_images(product_id,path,alt,sort_order,is_primary) VALUES(?,?,?,?,?)').run(productId,imagePath,String(data.alt||''),count,count===0?1:0);
+      } catch(err) {
+        queueImageDeletion(imagePath);
+        await persistDatabase();
+        await cleanupImages();
+        throw err;
+      }
+      await persistDatabase();
+      json(res,200,{id:Number(result.lastInsertRowid),path:imagePath});return;
     }
     m=pathname.match(/^\/api\/admin\/images\/(\d+)$/); if(m&&req.method==='DELETE'){
-      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const id=Number(m[1]);const img=db.prepare('SELECT * FROM product_images WHERE id=?').get(id);if(!img){json(res,404,{error:'Image not found'});return;}db.prepare('DELETE FROM product_images WHERE id=?').run(id);if(img.path.startsWith('/uploads/products/')){const f=path.join(PUBLIC,img.path);try{if(fs.existsSync(f))fs.unlinkSync(f)}catch{}}const any=db.prepare('SELECT id FROM product_images WHERE product_id=? ORDER BY sort_order,id LIMIT 1').get(img.product_id);if(any)db.prepare('UPDATE product_images SET is_primary=CASE WHEN id=? THEN 1 ELSE 0 END WHERE product_id=?').run(any.id,img.product_id);json(res,200,{ok:true});return;
+      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const id=Number(m[1]);const img=db.prepare('SELECT * FROM product_images WHERE id=?').get(id);if(!img){json(res,404,{error:'Image not found'});return;}db.prepare('DELETE FROM product_images WHERE id=?').run(id);queueImageDeletion(img.path);const any=db.prepare('SELECT id FROM product_images WHERE product_id=? ORDER BY sort_order,id LIMIT 1').get(img.product_id);if(any)db.prepare('UPDATE product_images SET is_primary=CASE WHEN id=? THEN 1 ELSE 0 END WHERE product_id=?').run(any.id,img.product_id);await persistDatabase();await cleanupImages();json(res,200,{ok:true});return;
     }
     m=pathname.match(/^\/api\/admin\/images\/(\d+)\/primary$/); if(m&&req.method==='POST'){
-      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const id=Number(m[1]);const img=db.prepare('SELECT * FROM product_images WHERE id=?').get(id);if(!img){json(res,404,{error:'Image not found'});return;}db.prepare('UPDATE product_images SET is_primary=CASE WHEN id=? THEN 1 ELSE 0 END WHERE product_id=?').run(id,img.product_id);json(res,200,{ok:true});return;
+      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const id=Number(m[1]);const img=db.prepare('SELECT * FROM product_images WHERE id=?').get(id);if(!img){json(res,404,{error:'Image not found'});return;}db.prepare('UPDATE product_images SET is_primary=CASE WHEN id=? THEN 1 ELSE 0 END WHERE product_id=?').run(id,img.product_id);await persistDatabase();json(res,200,{ok:true});return;
     }
     m=pathname.match(/^\/api\/admin\/orders\/(\d+)$/); if(m&&req.method==='PUT'){
-      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const d=await readJson(req);const allowedStatus=['new','processing','fulfilled','cancelled'],allowedPay=['pending','paid','refunded','cancelled'];if(!allowedStatus.includes(d.status)||!allowedPay.includes(d.payment_status)){json(res,400,{error:'Invalid order status.'});return;}db.prepare('UPDATE orders SET status=?,payment_status=? WHERE id=?').run(d.status,d.payment_status,Number(m[1]));json(res,200,{ok:true});return;
+      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const d=await readJson(req);const allowedStatus=['new','processing','fulfilled','cancelled'],allowedPay=['pending','paid','refunded','cancelled'];if(!allowedStatus.includes(d.status)||!allowedPay.includes(d.payment_status)){json(res,400,{error:'Invalid order status.'});return;}db.prepare('UPDATE orders SET status=?,payment_status=? WHERE id=?').run(d.status,d.payment_status,Number(m[1]));await persistDatabase();json(res,200,{ok:true});return;
     }
     if(pathname==='/api/admin/settings'&&req.method==='PUT'){
-      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const d=await readJson(req);const allowed=Object.keys(settingDefaults);const up=db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');for(const k of allowed)if(k in d)up.run(k,String(d[k]??''));json(res,200,{ok:true});return;
+      const s=requireAdmin(req,res,{api:true});if(!s)return;if(!verifyCsrf(req,s)){json(res,403,{error:'Security token expired.'});return;}const d=await readJson(req);const allowed=Object.keys(settingDefaults);const up=db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value');for(const k of allowed)if(k in d)up.run(k,String(d[k]??''));await persistDatabase();json(res,200,{ok:true});return;
     }
 
-    html(res,`${publicHeader('Not found')}<main><section class="page-hero"><div class="container"><h1>Page not found.</h1><a class="btn" href="/">Back home</a></div></section></main>${publicFooter()}`,404);
+    html(res,`${publicHeader('Not found',{canonicalPath:pathname,noindex:true})}<main><section class="page-hero"><div class="container"><h1>Page not found.</h1><a class="btn" href="/">Back home</a></div></section></main>${publicFooter()}`,404);
   } catch(err) {
     console.error(err);
-    if(!res.headersSent) json(res,500,{error:'Something went wrong.'}); else res.end();
+    if(!res.headersSent) json(res,err.statusCode||500,{error:err.statusCode?err.message:'Something went wrong. Please try again.'}); else res.end();
   }
+}
+// One writer prevents overlapping product/image/order mutations in this instance.
+let requestChain=Promise.resolve();
+const server=http.createServer((req,res)=>{
+  const pathname=new URL(req.url,BASE_URL).pathname;
+  const mutates=req.method!=='GET' || pathname==='/order/success';
+  if(mutates) requestChain=requestChain.catch(()=>{}).then(()=>handleRequest(req,res));
+  else handleRequest(req,res);
 });
+if(SUPABASE_ENABLED) setInterval(()=>{
+  requestChain=requestChain.catch(()=>{}).then(async()=>{
+    if(backupDirty) await persistDatabase();
+    await cleanupImages();
+  }).catch(err=>console.error('Storage retry:',err.message));
+},30000).unref();
 
 server.listen(PORT,()=>{
   console.log(`\nIsolde store is running at ${BASE_URL}`);
