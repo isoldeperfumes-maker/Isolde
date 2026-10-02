@@ -21,3 +21,7 @@
 .footer-logo{display:inline-flex;align-items:center;line-height:0;margin-bottom:14px}
 .footer-logo img{display:block;width:auto;height:58px;max-width:280px;object-fit:contain}
 @media (max-width:620px){.brand-logo img{height:44px;max-width:220px}.footer-logo img{height:50px;max-width:230px}}
+
+/* Free shipping notices */
+.free-shipping{margin:8px 0 0;color:#28553a;font-size:.82rem;font-weight:650}
+.shipping-banner{display:inline-block;margin:0 0 24px;padding:10px 16px;border:1px solid #c8d8c9;border-radius:999px;background:#edf4ed;color:#28553a;font-size:.93rem;font-weight:650}

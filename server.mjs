@@ -233,9 +233,9 @@ const settingDefaults = {
   contact_email: 'hello@isoldefragrance.com',
   contact_phone: '',
   instagram: '',
-  shipping_note: 'Shipping is currently confirmed after checkout. Configure your shipping method in Admin → Settings before launch.',
+  shipping_note: 'Free shipping on all orders.',
   footer_note: 'Independent fragrance house. Designer references are used only to describe scent inspiration.',
-  shipping_mode: 'quote',
+  shipping_mode: 'free',
   shipping_flat_fee: '',
   free_shipping_threshold: '',
   shipping_countries: 'Canada',
@@ -243,6 +243,20 @@ const settingDefaults = {
 };
 const insertSetting = db.prepare('INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)');
 for (const [k, v] of Object.entries(settingDefaults)) insertSetting.run(k, String(v));
+
+// Apply the store owner's free-shipping policy once, preserving later admin edits.
+if (!db.prepare("SELECT value FROM settings WHERE key='free_shipping_launch_v1'").get()) {
+  db.exec('BEGIN');
+  try {
+    db.prepare("UPDATE settings SET value='free' WHERE key='shipping_mode'").run();
+    db.prepare("UPDATE settings SET value='Free shipping on all orders.' WHERE key='shipping_note'").run();
+    insertSetting.run('free_shipping_launch_v1', '1');
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
+}
 
 const seedProducts = [
   {
@@ -498,7 +512,7 @@ function productCard(p) {
   return `<article class="product-card" data-product-card data-search="${e((p.name+' '+p.inspired_by+' '+p.category+' '+p.audience).toLowerCase())}" data-category="${e(p.category)}" data-audience="${e(p.audience||'Unisex')}" data-price="${p.price_cents||0}" data-name="${e(p.name)}" data-order="${p.sort_order}">
     <a class="product-media" href="/product/${e(p.slug)}"><img src="${e(p.image || '/assets/placeholder.svg')}" alt="${e(p.name)}" loading="lazy">${badge}</a>
     <div class="product-info"><div class="product-kicker">${e(p.audience||'Unisex')} · ${e(p.size_ml?`${p.size_ml} mL`:'Isolde')}</div><a class="product-name" href="/product/${e(p.slug)}">${e(p.name)}</a><div class="product-sub">Inspired by ${e(p.inspired_by)}</div>
-    <div class="product-bottom">${p.price_cents>0?`<span class="price">${e(money(p.price_cents))}</span><button class="quick-add" aria-label="Add ${e(p.name)} to bag" data-add-to-cart data-product='${addPayload}'>+</button>`:`<span class="coming">Price coming soon</span><a class="quick-add" href="/product/${e(p.slug)}" aria-label="View product">→</a>`}</div></div>
+    <div class="product-bottom">${p.price_cents>0?`<span class="price">${e(money(p.price_cents))}</span><button class="quick-add" aria-label="Add ${e(p.name)} to bag" data-add-to-cart data-product='${addPayload}'>+</button>`:`<span class="coming">Price coming soon</span><a class="quick-add" href="/product/${e(p.slug)}" aria-label="View product">→</a>`}</div>${shippingConfig().mode==='free'?'<p class="free-shipping">Free shipping</p>':''}</div>
   </article>`;
 }
 function homePage() {
@@ -514,7 +528,7 @@ function homePage() {
     {audience:'Unisex',title:'Unisex',copy:'Warm, distinctive scents designed beyond labels.',product:all.find(x=>x.slug==='golden-orchid')}
   ].filter(x=>x.product);
   return `${publicHeader('',{canonicalPath:'/',description:'Shop Isolde perfumes in Canada. Discover independent fragrances for women, men and unisex wear, with clear scent inspiration and 100 mL bottles.'})}<main>
-  <section class="lux-hero"><div class="container lux-hero-grid"><div class="lux-hero-copy"><div class="eyebrow">${e(s.hero_eyebrow)}</div><h1>${e(s.hero_title)}</h1><p class="lead">${e(s.hero_subtitle)}</p><div class="hero-actions"><a class="btn" href="/shop">Shop all fragrances</a><a class="text-link" href="/about">Discover the house →</a></div><div class="hero-facts"><span>100 mL</span><span>9 signature scents</span><span>Independent fragrance house</span></div></div>
+  <section class="lux-hero"><div class="container lux-hero-grid"><div class="lux-hero-copy"><div class="eyebrow">${e(s.hero_eyebrow)}</div><h1>${e(s.hero_title)}</h1><p class="lead">${e(s.hero_subtitle)}</p>${shippingConfig().mode==='free'?'<p class="shipping-banner">Free shipping on all orders</p>':''}<div class="hero-actions"><a class="btn" href="/shop">Shop all fragrances</a><a class="text-link" href="/about">Discover the house →</a></div><div class="hero-facts"><span>100 mL</span><span>9 signature scents</span><span>Independent fragrance house</span></div></div>
   <div class="lux-hero-media"><a class="hero-main-photo" href="/product/${e(heroMain.slug)}"><img src="${e(heroMain.image)}" alt="${e(heroMain.name)}"><div class="image-caption"><span>${e(heroMain.name)}</span><strong>${e(money(heroMain.price_cents))}</strong></div></a><a class="hero-float-photo" href="/product/${e(heroSide.slug)}"><img src="${e(heroSide.image)}" alt="${e(heroSide.name)}"></a></div></div></section>
 
   <div class="feature-strip"><div class="container"><div class="feature"><strong>100 mL collection</strong><span>Full-size bottles across the entire launch range.</span></div><div class="feature"><strong>Transparent inspiration</strong><span>Every product clearly identifies the fragrance direction that inspired it.</span></div><div class="feature"><strong>Independent identity</strong><span>Original Isolde naming, imagery and brand presentation.</span></div></div></div>
@@ -545,13 +559,13 @@ function productPage(p) {
   return `${baseHead(p.name,p.description,{canonicalPath,image,type:'product'}).replace('</head>',`<script type="application/ld+json">${JSON.stringify(jsonLd).replace(/</g,'\\u003c')}</script></head>`)}
   <div class="announcement">${e(s.announcement)}</div><header class="site-header"><div class="container nav"><nav class="nav-links"><a href="/shop">Shop</a><a href="/shop?audience=Women">Women</a><a href="/shop?audience=Men">Men</a><a href="/shop?audience=Unisex">Unisex</a></nav><button class="menu-button" data-menu-toggle>☰</button><a class="brand brand-logo" href="/" aria-label="${e(s.brand_name)} home"><img src="/assets/isolde-logo.png" alt="${e(s.brand_name)}"></a><div class="nav-actions"><a href="/about">Our Story</a><a class="bag-pill" href="/cart">Bag <span data-cart-count>0</span></a></div></div><div class="mobile-menu" data-mobile-menu><a href="/shop">Shop all</a><a href="/shop?audience=Women">Women</a><a href="/shop?audience=Men">Men</a><a href="/shop?audience=Unisex">Unisex</a><a href="/about">Our Story</a></div></header>
   <main><div class="container product-page"><div><div class="gallery-main"><img src="${e(image)}" alt="${e(p.name)}"></div>${p.images.length>1?`<div class="thumbs">${p.images.map(i=>`<button class="thumb" type="button" data-gallery-thumb data-image="${e(i.path)}"><img src="${e(i.path)}" alt="${e(i.alt)}"></button>`).join('')}</div>`:''}</div>
-  <div class="product-detail"><div class="product-detail-topline"><span>${e(p.audience||'Unisex')}</span><span>${e(p.category)}</span></div><h1>${e(p.name)}</h1><div class="inspired-line">Inspired by <strong>${e(p.inspired_by)}</strong></div>${p.price_cents>0?`<div class="detail-price">${e(money(p.price_cents))}</div>`:'<div class="coming" style="margin-top:22px">Price coming soon.</div>'}<p class="product-description">${e(p.description)}</p>
+  <div class="product-detail"><div class="product-detail-topline"><span>${e(p.audience||'Unisex')}</span><span>${e(p.category)}</span></div><h1>${e(p.name)}</h1><div class="inspired-line">Inspired by <strong>${e(p.inspired_by)}</strong></div>${p.price_cents>0?`<div class="detail-price">${e(money(p.price_cents))}</div>`:'<div class="coming" style="margin-top:22px">Price coming soon.</div>'}${shippingConfig().mode==='free'?'<p class="free-shipping">Free shipping</p>':''}<p class="product-description">${e(p.description)}</p>
   ${p.price_cents>0?`<div data-product-buy><div class="buy-row"><input class="field qty-input" type="number" min="1" value="1" name="qty"><button class="btn" data-add-to-cart data-product='${payload}'>Add to bag</button></div></div>`:`<a class="btn btn-outline" href="/contact">Ask about this fragrance</a>`}
   <div class="product-assurance"><div><strong>100 mL bottle</strong><span>Full-size Isolde fragrance</span></div><div><strong>Independent fragrance</strong><span>Transparent inspired-by reference</span></div></div>
   <div class="product-meta">${p.size_ml?`<div class="meta-row"><span>Size</span><strong>${p.size_ml} mL</strong></div>`:''}<div class="meta-row"><span>For</span><strong>${e(p.audience||'Unisex')}</strong></div><div class="meta-row"><span>Scent family</span><strong>${e(p.category)}</strong></div>${p.sku?`<div class="meta-row"><span>SKU</span><strong>${e(p.sku)}</strong></div>`:''}</div><p class="small muted" style="margin-top:18px">Independent fragrance interpretation. Not affiliated with or endorsed by the referenced designer brand.</p></div></div></main>${publicFooter()}`;
 }
 function cartPage() {
-  return `${publicHeader('Bag',{canonicalPath:'/cart',noindex:true})}<main><section class="page-hero"><div class="container"><div class="eyebrow">Your bag</div><h1>Your Isolde selection.</h1></div></section><section style="padding-top:10px"><div class="container cart-layout"><div><div data-cart-page></div><div data-cart-empty hidden><p class="lead">Your bag is empty.</p><a class="btn" href="/shop">Explore fragrances</a></div></div><aside class="summary-card" data-cart-summary hidden><h3 style="font-size:1.7rem;margin-top:0">Order summary</h3><div class="summary-row"><span>Items</span><span data-cart-items>0</span></div><div class="summary-row"><span>Subtotal</span><strong data-cart-subtotal>—</strong></div><p class="small muted">Shipping and applicable tax are confirmed during checkout.</p><a class="btn" href="/checkout">Continue to checkout</a></aside></div></section></main>${publicFooter()}`;
+  return `${publicHeader('Bag',{canonicalPath:'/cart',noindex:true})}<main><section class="page-hero"><div class="container"><div class="eyebrow">Your bag</div><h1>Your Isolde selection.</h1></div></section><section style="padding-top:10px"><div class="container cart-layout"><div><div data-cart-page></div><div data-cart-empty hidden><p class="lead">Your bag is empty.</p><a class="btn" href="/shop">Explore fragrances</a></div></div><aside class="summary-card" data-cart-summary hidden><h3 style="font-size:1.7rem;margin-top:0">Order summary</h3><div class="summary-row"><span>Items</span><span data-cart-items>0</span></div><div class="summary-row"><span>Subtotal</span><strong data-cart-subtotal>—</strong></div><p class="small muted">${shippingConfig().mode==='free'?'Free shipping on all orders. Applicable tax is confirmed during checkout.':'Shipping and applicable tax are confirmed during checkout.'}</p><a class="btn" href="/checkout">Continue to checkout</a></aside></div></section></main>${publicFooter()}`;
 }
 function checkoutPage() {
   const s=settings();
