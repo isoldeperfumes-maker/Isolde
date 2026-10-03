@@ -1,0 +1,7 @@
+name = "isolde-store-front"
+main = "cloudflare-worker.mjs"
+compatibility_date = "2026-10-03"
+workers_dev = false
+
+# Add isolde.ca as a Custom Domain in the Cloudflare Worker dashboard.
+# Set ORIGIN_URL there to the service's https://<name>.onrender.com URL.
