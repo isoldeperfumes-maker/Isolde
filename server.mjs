@@ -474,22 +474,35 @@ function getAdminProduct(id) {
 function baseHead(title, description='', options={}) {
   const s=settings();
   const isHome=!title || title===s.brand_name;
-  const pageTitle=isHome ? `${s.brand_name} Perfumes | Independent Fragrance House in Canada` : `${title} | ${s.brand_name}`;
-  const metaDescription=String(description || s.hero_subtitle || 'Discover Isolde fragrances, an independent perfume collection in Canada.').trim();
+  const pageTitle=String(options.pageTitle || (isHome
+    ? `${s.brand_name} Perfumes Canada | Women, Men & Unisex Fragrances`
+    : `${title} | ${s.brand_name} Perfumes Canada`)).trim();
+  const rawDescription=String(description || s.hero_subtitle || 'Discover Isolde fragrances, an independent perfume collection in Canada.').replace(/\s+/g,' ').trim();
+  const metaDescription=rawDescription.length>165 ? rawDescription.slice(0,162).replace(/\s+\S*$/,'')+'…' : rawDescription;
   const canonicalPath=String(options.canonicalPath || '/');
   const canonical=`${BASE_URL}${canonicalPath.startsWith('/')?canonicalPath:'/'+canonicalPath}`;
   const ogImage=absoluteAssetUrl(options.image || '/assets/isolde-logo.png');
-  const robots=options.noindex ? 'noindex,nofollow' : 'index,follow,max-image-preview:large';
+  const robots=options.noindex ? 'noindex,nofollow' : 'index,follow,max-image-preview:large,max-snippet:-1,max-video-preview:-1';
   const organization={
-    "@context":"https://schema.org",
     "@type":"Organization",
+    "@id":`${BASE_URL}/#organization`,
     name:s.brand_name,
     url:BASE_URL,
-    logo:absoluteAssetUrl('/assets/isolde-logo.png'),
-    description:metaDescription
+    logo:{"@type":"ImageObject",url:absoluteAssetUrl('/assets/isolde-logo.png')},
+    description:'Independent fragrance house in Canada offering Isolde perfumes for women, men and unisex wear.'
   };
   if(s.contact_email) organization.email=s.contact_email;
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e(pageTitle)}</title><meta name="description" content="${e(metaDescription)}"><meta name="robots" content="${robots}"><link rel="canonical" href="${e(canonical)}"><link rel="icon" type="image/png" href="/assets/isolde-logo.png"><meta name="theme-color" content="#171512"><meta property="og:site_name" content="${e(s.brand_name)}"><meta property="og:type" content="${e(options.type || 'website')}"><meta property="og:title" content="${e(pageTitle)}"><meta property="og:description" content="${e(metaDescription)}"><meta property="og:url" content="${e(canonical)}"><meta property="og:image" content="${e(ogImage)}"><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="${e(pageTitle)}"><meta name="twitter:description" content="${e(metaDescription)}"><meta name="twitter:image" content="${e(ogImage)}">${GOOGLE_SITE_VERIFICATION?`<meta name="google-site-verification" content="${e(GOOGLE_SITE_VERIFICATION)}">`:''}<script type="application/ld+json">${JSON.stringify(organization).replace(/</g,'\\u003c')}</script><link rel="stylesheet" href="/assets/styles.css"><script>window.ISOLDE_CURRENCY=${JSON.stringify(s.currency || 'CAD')};window.ISOLDE_SHIPPING=${JSON.stringify(shippingConfig())}</script><script src="/assets/store.js" defer></script></head><body>`;
+  if(/^https?:\/\//i.test(String(s.instagram||''))) organization.sameAs=[s.instagram];
+  const website={
+    "@type":"WebSite",
+    "@id":`${BASE_URL}/#website`,
+    url:BASE_URL,
+    name:s.brand_name,
+    publisher:{"@id":`${BASE_URL}/#organization`},
+    inLanguage:'en-CA'
+  };
+  const structured={"@context":"https://schema.org","@graph":[organization,website]};
+  return `<!doctype html><html lang="en-CA"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e(pageTitle)}</title><meta name="description" content="${e(metaDescription)}"><meta name="robots" content="${robots}"><link rel="canonical" href="${e(canonical)}"><link rel="icon" type="image/png" href="/assets/isolde-logo.png"><meta name="theme-color" content="#171512"><meta property="og:locale" content="en_CA"><meta property="og:site_name" content="${e(s.brand_name)}"><meta property="og:type" content="${e(options.type || 'website')}"><meta property="og:title" content="${e(pageTitle)}"><meta property="og:description" content="${e(metaDescription)}"><meta property="og:url" content="${e(canonical)}"><meta property="og:image" content="${e(ogImage)}"><meta property="og:image:alt" content="${e(options.imageAlt || pageTitle)}"><meta name="twitter:card" content="summary_large_image"><meta name="twitter:title" content="${e(pageTitle)}"><meta name="twitter:description" content="${e(metaDescription)}"><meta name="twitter:image" content="${e(ogImage)}">${GOOGLE_SITE_VERIFICATION?`<meta name="google-site-verification" content="${e(GOOGLE_SITE_VERIFICATION)}">`:''}<script type="application/ld+json">${JSON.stringify(structured).replace(/</g,'\\u003c')}</script><link rel="stylesheet" href="/assets/styles.css"><script>window.ISOLDE_CURRENCY=${JSON.stringify(s.currency || 'CAD')};window.ISOLDE_SHIPPING=${JSON.stringify(shippingConfig())}</script><script src="/assets/store.js" defer></script></head><body>`;
 }
 function publicHeader(active='', seo={}) {
   const s=settings();
@@ -550,20 +563,97 @@ function homePage() {
 function shopPage() {
   const products=getProducts();
   const cats=[...new Set(products.map(p=>p.category))];
-  return `${publicHeader('Shop',{canonicalPath:'/shop',description:'Shop the complete Isolde perfume collection in Canada. Browse fragrances for women, men and unisex wear by scent family, inspiration and price.'})}<main><section class="page-hero shop-hero"><div class="container"><div class="eyebrow">The Isolde Collection</div><h1>Find your signature.</h1><p class="lead">Explore all ${products.length} fragrances by audience, scent family, inspiration or price.</p></div></section>
+  const description='Shop Isolde perfumes in Canada. Browse 100 mL fragrances for women, men and unisex wear by scent family, inspiration and price, with free shipping.';
+  const collectionLd={
+    "@context":"https://schema.org",
+    "@type":"CollectionPage",
+    "@id":`${BASE_URL}/shop#collection`,
+    url:`${BASE_URL}/shop`,
+    name:'Shop Isolde Perfumes in Canada',
+    description,
+    isPartOf:{"@id":`${BASE_URL}/#website`},
+    mainEntity:{
+      "@type":"ItemList",
+      numberOfItems:products.length,
+      itemListElement:products.map((p,index)=>({
+        "@type":"ListItem",
+        position:index+1,
+        url:`${BASE_URL}/product/${encodeURIComponent(p.slug)}`,
+        name:p.name,
+        image:absoluteAssetUrl(p.image || '/assets/isolde-logo.png')
+      }))
+    }
+  };
+  const head=baseHead('Shop',description,{canonicalPath:'/shop',pageTitle:'Shop Perfumes in Canada | Women, Men & Unisex | Isolde'});
+  return `${head.replace('</head>',`<script type="application/ld+json">${JSON.stringify(collectionLd).replace(/</g,'\\u003c')}</script></head>`)}<div class="announcement">${e(settings().announcement)}</div><header class="site-header"><div class="container nav">
+    <nav class="nav-links"><a href="/shop">Shop</a><a href="/shop?audience=Women">Women</a><a href="/shop?audience=Men">Men</a><a href="/shop?audience=Unisex">Unisex</a></nav>
+    <button class="menu-button" data-menu-toggle aria-label="Menu">☰</button>
+    <a class="brand brand-logo" href="/" aria-label="${e(settings().brand_name)} home"><img src="/assets/isolde-logo.png" alt="${e(settings().brand_name)} perfume logo"></a>
+    <div class="nav-actions"><a href="/about">Our Story</a><a class="bag-pill" href="/cart">Bag <span data-cart-count>0</span></a></div>
+  </div><div class="mobile-menu" data-mobile-menu><a href="/shop">Shop all</a><a href="/shop?audience=Women">Women</a><a href="/shop?audience=Men">Men</a><a href="/shop?audience=Unisex">Unisex</a><a href="/about">Our Story</a><a href="/contact">Contact</a></div></header><main><section class="page-hero shop-hero"><div class="container"><div class="eyebrow">The Isolde Collection</div><h1>Find your signature.</h1><p class="lead">Explore all ${products.length} fragrances by audience, scent family, inspiration or price.</p></div></section>
   <section style="padding-top:20px"><div class="container"><div class="shop-toolbar shop-toolbar-4"><input class="field" data-shop-search placeholder="Search fragrances or inspirations…"><select class="select" data-shop-audience><option value="">Women, Men & Unisex</option><option>Women</option><option>Men</option><option>Unisex</option></select><select class="select" data-shop-category><option value="">All scent families</option>${cats.map(c=>`<option>${e(c)}</option>`).join('')}</select><select class="select" data-shop-sort><option value="default">Curated order</option><option value="name">Name A–Z</option><option value="price-asc">Price low to high</option><option value="price-desc">Price high to low</option></select></div><div class="shop-result-line"><span><strong data-shop-count>${products.length}</strong> fragrances</span><a href="/shop">Clear filters</a></div><div class="product-grid" data-shop-grid>${products.map(productCard).join('')}</div></div></section></main>${publicFooter()}`;
 }
 function productPage(p) {
   const s=settings();
+  const ship=shippingConfig();
   const image=(p.images[0]?.path || '');
   const payload=JSON.stringify({id:p.id,slug:p.slug,name:p.name,inspiredBy:p.inspired_by,image,priceCents:p.price_cents}).replace(/'/g,'&#39;');
   const canonicalPath=`/product/${encodeURIComponent(p.slug)}`;
-  const jsonLd={"@context":"https://schema.org","@type":"Product",name:p.name,brand:{"@type":"Brand",name:s.brand_name},description:p.description,image:p.images.map(i=>absoluteAssetUrl(i.path)),sku:p.sku||undefined,url:`${BASE_URL}${canonicalPath}`};
-  if(p.price_cents>0) jsonLd.offers={"@type":"Offer",priceCurrency:s.currency,price:(p.price_cents/100).toFixed(2),availability:p.stock===0?"https://schema.org/OutOfStock":"https://schema.org/InStock",url:`${BASE_URL}${canonicalPath}`,seller:{"@type":"Organization",name:s.brand_name}};
-  return `${baseHead(p.name,p.description,{canonicalPath,image,type:'product'}).replace('</head>',`<script type="application/ld+json">${JSON.stringify(jsonLd).replace(/</g,'\\u003c')}</script></head>`)}
-  <div class="announcement">${e(s.announcement)}</div><header class="site-header"><div class="container nav"><nav class="nav-links"><a href="/shop">Shop</a><a href="/shop?audience=Women">Women</a><a href="/shop?audience=Men">Men</a><a href="/shop?audience=Unisex">Unisex</a></nav><button class="menu-button" data-menu-toggle>☰</button><a class="brand brand-logo" href="/" aria-label="${e(s.brand_name)} home"><img src="/assets/isolde-logo.png" alt="${e(s.brand_name)}"></a><div class="nav-actions"><a href="/about">Our Story</a><a class="bag-pill" href="/cart">Bag <span data-cart-count>0</span></a></div></div><div class="mobile-menu" data-mobile-menu><a href="/shop">Shop all</a><a href="/shop?audience=Women">Women</a><a href="/shop?audience=Men">Men</a><a href="/shop?audience=Unisex">Unisex</a><a href="/about">Our Story</a></div></header>
-  <main><div class="container product-page"><div><div class="gallery-main"><img src="${e(image)}" alt="${e(p.name)}"></div>${p.images.length>1?`<div class="thumbs">${p.images.map(i=>`<button class="thumb" type="button" data-gallery-thumb data-image="${e(i.path)}"><img src="${e(i.path)}" alt="${e(i.alt)}"></button>`).join('')}</div>`:''}</div>
-  <div class="product-detail"><div class="product-detail-topline"><span>${e(p.audience||'Unisex')}</span><span>${e(p.category)}</span></div><h1>${e(p.name)}</h1><div class="inspired-line">Inspired by <strong>${e(p.inspired_by)}</strong></div>${p.price_cents>0?`<div class="detail-price">${e(money(p.price_cents))}</div>`:'<div class="coming" style="margin-top:22px">Price coming soon.</div>'}${shippingConfig().mode==='free'?'<p class="free-shipping">Free shipping</p>':''}<p class="product-description">${e(p.description)}</p>
+  const sizeLabel=p.size_ml ? `${p.size_ml} mL` : 'fragrance';
+  const shippingCopy=ship.mode==='free' ? ' Free shipping in Canada.' : '';
+  const metaDescription=`Shop ${p.name}, a ${sizeLabel} ${String(p.audience||'unisex').toLowerCase()} fragrance by Isolde inspired by ${p.inspired_by}.${shippingCopy}`;
+  const productLd={
+    "@type":"Product",
+    "@id":`${BASE_URL}${canonicalPath}#product`,
+    name:p.name,
+    brand:{"@type":"Brand",name:s.brand_name},
+    description:p.description,
+    image:p.images.map(i=>absoluteAssetUrl(i.path)),
+    url:`${BASE_URL}${canonicalPath}`,
+    category:p.category,
+    audience:{"@type":"PeopleAudience",suggestedGender:p.audience||'Unisex'},
+    size:p.size_ml ? `${p.size_ml} mL` : undefined,
+    sku:p.sku||undefined
+  };
+  if(p.price_cents>0) {
+    const offer={
+      "@type":"Offer",
+      priceCurrency:s.currency||'CAD',
+      price:(p.price_cents/100).toFixed(2),
+      availability:p.stock===0?"https://schema.org/OutOfStock":"https://schema.org/InStock",
+      itemCondition:"https://schema.org/NewCondition",
+      url:`${BASE_URL}${canonicalPath}`,
+      seller:{"@id":`${BASE_URL}/#organization`}
+    };
+    if(ship.mode==='free' && ship.countries.some(country=>country.toLowerCase()==='canada')) {
+      offer.shippingDetails={
+        "@type":"OfferShippingDetails",
+        shippingRate:{"@type":"MonetaryAmount",value:"0.00",currency:s.currency||'CAD'},
+        shippingDestination:{"@type":"DefinedRegion",addressCountry:"CA"}
+      };
+    }
+    productLd.offers=offer;
+  }
+  const jsonLd={
+    "@context":"https://schema.org",
+    "@graph":[
+      productLd,
+      {
+        "@type":"BreadcrumbList",
+        "@id":`${BASE_URL}${canonicalPath}#breadcrumb`,
+        itemListElement:[
+          {"@type":"ListItem",position:1,name:"Home",item:BASE_URL},
+          {"@type":"ListItem",position:2,name:"Shop",item:`${BASE_URL}/shop`},
+          {"@type":"ListItem",position:3,name:p.name,item:`${BASE_URL}${canonicalPath}`}
+        ]
+      }
+    ]
+  };
+  const head=baseHead(p.name,metaDescription,{canonicalPath,image,imageAlt:`${p.name} by Isolde`,type:'product',pageTitle:`${p.name} ${sizeLabel} Perfume | Isolde Canada`});
+  return `${head.replace('</head>',`<script type="application/ld+json">${JSON.stringify(jsonLd).replace(/</g,'\\u003c')}</script></head>`)}
+  <div class="announcement">${e(s.announcement)}</div><header class="site-header"><div class="container nav"><nav class="nav-links"><a href="/shop">Shop</a><a href="/shop?audience=Women">Women</a><a href="/shop?audience=Men">Men</a><a href="/shop?audience=Unisex">Unisex</a></nav><button class="menu-button" data-menu-toggle aria-label="Menu">☰</button><a class="brand brand-logo" href="/" aria-label="${e(s.brand_name)} home"><img src="/assets/isolde-logo.png" alt="${e(s.brand_name)} perfume logo"></a><div class="nav-actions"><a href="/about">Our Story</a><a class="bag-pill" href="/cart">Bag <span data-cart-count>0</span></a></div></div><div class="mobile-menu" data-mobile-menu><a href="/shop">Shop all</a><a href="/shop?audience=Women">Women</a><a href="/shop?audience=Men">Men</a><a href="/shop?audience=Unisex">Unisex</a><a href="/about">Our Story</a><a href="/contact">Contact</a></div></header>
+  <main><div class="container product-page"><div><div class="gallery-main"><img src="${e(image)}" alt="${e(p.name)} by Isolde"></div>${p.images.length>1?`<div class="thumbs">${p.images.map(i=>`<button class="thumb" type="button" data-gallery-thumb data-image="${e(i.path)}"><img src="${e(i.path)}" alt="${e(i.alt || p.name)}"></button>`).join('')}</div>`:''}</div>
+  <div class="product-detail"><div class="product-detail-topline"><span>${e(p.audience||'Unisex')}</span><span>${e(p.category)}</span></div><h1>${e(p.name)}</h1><div class="inspired-line">Inspired by <strong>${e(p.inspired_by)}</strong></div>${p.price_cents>0?`<div class="detail-price">${e(money(p.price_cents))}</div>`:'<div class="coming" style="margin-top:22px">Price coming soon.</div>'}${ship.mode==='free'?'<p class="free-shipping">Free shipping</p>':''}<p class="product-description">${e(p.description)}</p>
   ${p.price_cents>0?`<div data-product-buy><div class="buy-row"><input class="field qty-input" type="number" min="1" value="1" name="qty"><button class="btn" data-add-to-cart data-product='${payload}'>Add to bag</button></div></div>`:`<a class="btn btn-outline" href="/contact">Ask about this fragrance</a>`}
   <div class="product-assurance"><div><strong>100 mL bottle</strong><span>Full-size Isolde fragrance</span></div><div><strong>Independent fragrance</strong><span>Transparent inspired-by reference</span></div></div>
   <div class="product-meta">${p.size_ml?`<div class="meta-row"><span>Size</span><strong>${p.size_ml} mL</strong></div>`:''}<div class="meta-row"><span>For</span><strong>${e(p.audience||'Unisex')}</strong></div><div class="meta-row"><span>Scent family</span><strong>${e(p.category)}</strong></div>${p.sku?`<div class="meta-row"><span>SKU</span><strong>${e(p.sku)}</strong></div>`:''}</div><p class="small muted" style="margin-top:18px">Independent fragrance interpretation. Not affiliated with or endorsed by the referenced designer brand.</p></div></div></main>${publicFooter()}`;
@@ -806,8 +896,10 @@ async function handleRequest(req,res) {
     if(req.method==='GET' && pathname==='/api/products'){json(res,200,getProducts());return;}
     if(req.method==='GET' && pathname==='/robots.txt'){text(res,`User-agent: *\nAllow: /\nDisallow: /admin\nDisallow: /api/\nDisallow: /cart\nDisallow: /checkout\nDisallow: /order/\nSitemap: ${BASE_URL}/sitemap.xml\n`);return;}
     if(req.method==='GET' && pathname==='/sitemap.xml'){
-      const urls=['/','/shop','/about','/contact',...getProducts().map(p=>'/product/'+encodeURIComponent(p.slug))];
-      text(res,`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.map(x=>`<url><loc>${e(BASE_URL+x)}</loc></url>`).join('')}</urlset>`,'application/xml; charset=utf-8');return;
+      const staticUrls=['/','/shop','/about','/contact','/shipping','/returns','/privacy','/terms'].map(path=>({path}));
+      const productUrls=getProducts().map(p=>({path:'/product/'+encodeURIComponent(p.slug),lastmod:String(p.updated_at||'').slice(0,10)}));
+      const urls=[...staticUrls,...productUrls];
+      text(res,`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.map(row=>`<url><loc>${e(BASE_URL+row.path)}</loc>${row.lastmod?`<lastmod>${e(row.lastmod)}</lastmod>`:''}</url>`).join('')}</urlset>`,'application/xml; charset=utf-8');return;
     }
     if(req.method==='POST' && pathname==='/api/stripe/webhook') {
       if(!STRIPE_WEBHOOK_SECRET) { json(res,503,{error:'Webhook is not configured.'}); return; }
