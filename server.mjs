@@ -37,6 +37,9 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'Isolde123!';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'local-development-secret-change-me';
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const ORDER_NOTIFICATION_EMAIL = process.env.ORDER_NOTIFICATION_EMAIL || ADMIN_EMAIL;
+const ORDER_NOTIFICATION_FROM = process.env.ORDER_NOTIFICATION_FROM || 'Isolde Orders <orders@isolde.ca>';
 const GOOGLE_SITE_VERIFICATION = process.env.GOOGLE_SITE_VERIFICATION || '';
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || '';
@@ -190,6 +193,7 @@ ensureColumn('products', 'audience', "TEXT NOT NULL DEFAULT 'Unisex'");
 ensureColumn('products', 'bestseller', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('orders','currency',"TEXT NOT NULL DEFAULT 'CAD'");
 ensureColumn('orders','checkout_key','TEXT');
+ensureColumn('orders','notification_sent','INTEGER NOT NULL DEFAULT 0');
 ensureColumn('order_items','image',"TEXT NOT NULL DEFAULT ''");
 db.exec('CREATE UNIQUE INDEX IF NOT EXISTS orders_checkout_key ON orders(checkout_key) WHERE checkout_key IS NOT NULL');
 
@@ -700,7 +704,7 @@ async function createStripeSession(order, items) {
   return data;
 }
 function applyStripePayment(data, expectedOrder='') {
-  if(data.payment_status!=='paid') return false;
+  if(data.payment_status!=='paid') return 0;
   const order=db.prepare('SELECT * FROM orders WHERE stripe_session_id=?').get(data.id);
   if(!order || (expectedOrder && order.order_number!==expectedOrder) ||
      String(order.id)!==String(data.metadata?.order_id) || order.order_number!==data.metadata?.order_number ||
@@ -708,16 +712,71 @@ function applyStripePayment(data, expectedOrder='') {
      Number(data.amount_total)!==order.total_cents || String(data.currency).toUpperCase()!==order.currency) {
     throw new Error('Stripe payment does not match a saved order.');
   }
-  db.prepare("UPDATE orders SET payment_status='paid', status=CASE WHEN status='new' THEN 'processing' ELSE status END WHERE id=? AND payment_status='pending'").run(order.id);
+  const updated=db.prepare("UPDATE orders SET payment_status='paid', status=CASE WHEN status='new' THEN 'processing' ELSE status END WHERE id=? AND payment_status='pending'").run(order.id);
+  return Number(updated.changes||0)>0 ? Number(order.id) : 0;
+}
+async function sendPaidOrderNotification(orderId) {
+  if(!RESEND_API_KEY || !ORDER_NOTIFICATION_EMAIL || !ORDER_NOTIFICATION_FROM) return false;
+  const order=db.prepare('SELECT * FROM orders WHERE id=?').get(orderId);
+  if(!order || order.payment_status!=='paid' || Number(order.notification_sent||0)===1) return false;
+  const items=db.prepare('SELECT name,qty,unit_price_cents FROM order_items WHERE order_id=? ORDER BY id').all(order.id);
+  const money=cents=>new Intl.NumberFormat('en-CA',{style:'currency',currency:order.currency||'CAD'}).format(Number(cents||0)/100);
+  const lines=[
+    `New paid order: ${order.order_number}`,
+    '',
+    `Customer: ${order.customer_name}`,
+    `Email: ${order.email}`,
+    `Phone: ${order.phone||'-'}`,
+    '',
+    'Ship to:',
+    order.address1,
+    order.address2||'',
+    `${order.city}, ${order.province} ${order.postal_code}`,
+    order.country,
+    '',
+    'Items:',
+    ...items.map(item=>`- ${item.name} x${item.qty} — ${money(item.unit_price_cents*item.qty)}`),
+    '',
+    `Subtotal: ${money(order.subtotal_cents)}`,
+    `Shipping: ${money(order.shipping_cents)}`,
+    `Total: ${money(order.total_cents)}`,
+    '',
+    `Admin: ${BASE_URL}/admin/orders/${order.id}`
+  ].filter((line,index,arr)=>line!=='' || arr[index-1]!=='').join('\n');
+  const response=await fetch('https://api.resend.com/emails',{
+    method:'POST',
+    headers:{Authorization:`Bearer ${RESEND_API_KEY}`,'Content-Type':'application/json'},
+    body:JSON.stringify({
+      from:ORDER_NOTIFICATION_FROM,
+      to:[ORDER_NOTIFICATION_EMAIL],
+      subject:`New Isolde order ${order.order_number} — ${money(order.total_cents)}`,
+      text:lines
+    }),
+    signal:AbortSignal.timeout(20000)
+  });
+  if(!response.ok) {
+    const detail=await response.text().catch(()=> '');
+    throw new Error(`Order email failed (${response.status}): ${detail.slice(0,300)}`);
+  }
+  db.prepare('UPDATE orders SET notification_sent=1 WHERE id=?').run(order.id);
+  await persistDatabase();
   return true;
+}
+async function notifyPaidOrderSafely(orderId) {
+  if(!orderId) return;
+  try { await sendPaidOrderNotification(orderId); }
+  catch(err) { console.error('Paid order email notification failed:',err.message); }
 }
 async function verifyStripeSuccess(sessionId,orderNo) {
   if(!STRIPE_SECRET_KEY || !sessionId || !orderNo) return false;
   const response=await fetch(`https://api.stripe.com/v1/checkout/sessions/${encodeURIComponent(sessionId)}`,{headers:{Authorization:`Bearer ${STRIPE_SECRET_KEY}`},signal:AbortSignal.timeout(20000)});
   if(!response.ok) return false;
-  const paid=applyStripePayment(await response.json(),orderNo);
-  if(paid) await persistDatabase();
-  return paid;
+  const paidOrderId=applyStripePayment(await response.json(),orderNo);
+  if(paidOrderId) {
+    await persistDatabase();
+    await notifyPaidOrderSafely(paidOrderId);
+  }
+  return !!paidOrderId;
 }
 function verifiedStripeEvent(raw,header='') {
   const values=String(header).split(',').map(part=>part.split('='));
@@ -756,7 +815,11 @@ async function handleRequest(req,res) {
       try { event=verifiedStripeEvent(await readBody(req,1024*1024),req.headers['stripe-signature']); }
       catch { json(res,400,{error:'Invalid webhook.'}); return; }
       if(['checkout.session.completed','checkout.session.async_payment_succeeded'].includes(event.type)) {
-        if(applyStripePayment(event.data.object)) await persistDatabase();
+        const paidOrderId=applyStripePayment(event.data.object);
+        if(paidOrderId) {
+          await persistDatabase();
+          await notifyPaidOrderSafely(paidOrderId);
+        }
       }
       json(res,200,{received:true}); return;
     }
